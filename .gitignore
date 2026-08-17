@@ -111,3 +111,9 @@ screenshots/*.webm
 
 replays/
 results/
+
+# macOS
+.DS_Store
+
+# Runtime logs
+logs/
