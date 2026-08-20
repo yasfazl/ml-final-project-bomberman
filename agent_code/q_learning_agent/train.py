@@ -1,99 +1,208 @@
 from collections import namedtuple, deque
-
-import pickle
 from typing import List
 
+import pickle
+import numpy as np
+
 import events as e
-from .callbacks import state_to_features
+from .callbacks import (
+    ACTIONS,
+    state_to_features,
+    MODEL_PATH,
+)
 
-# This is only an example!
-Transition = namedtuple('Transition',
-                        ('state', 'action', 'next_state', 'reward'))
+# ---------------------------------------------------------------------------
+# Hyperparameters
+# ---------------------------------------------------------------------------
 
-# Hyper parameters -- DO modify
-TRANSITION_HISTORY_SIZE = 3  # keep only ... last transitions
-RECORD_ENEMY_TRANSITIONS = 1.0  # record enemy transitions with probability ...
+ALPHA = 0.01          # learning rate
+GAMMA = 0.9           # discount factor
 
-# Events
-PLACEHOLDER_EVENT = "PLACEHOLDER"
+EPSILON_START = 1.0   # initial exploration rate
+EPSILON_MIN = 0.1     # minimum exploration rate
+EPSILON_DECAY = 0.995 # multiplicative decay per episode
+EXPLORE_EPISODES = 100  # pure exploration before decay starts
 
+# ---------------------------------------------------------------------------
+# Reward values
+# ---------------------------------------------------------------------------
+
+REWARD_COIN_COLLECTED = 10.0
+REWARD_MOVED_TOWARD_COIN = 2.0
+REWARD_MOVED_AWAY_FROM_COIN = -2.0
+REWARD_WAITED = -1.0
+REWARD_INVALID_ACTION = -1.0
+
+# Custom event name
+MOVED_TOWARD_COIN = "MOVED_TOWARD_COIN"
+MOVED_AWAY_FROM_COIN = "MOVED_AWAY_FROM_COIN"
+
+# ---------------------------------------------------------------------------
+# Transition tuple
+# ---------------------------------------------------------------------------
+
+Transition = namedtuple("Transition", ("state", "action", "reward"))
+
+
+# ---------------------------------------------------------------------------
+# Callbacks
+# ---------------------------------------------------------------------------
 
 def setup_training(self):
     """
-    Initialise self for training purpose.
-
-    This is called after `setup` in callbacks.py.
-
-    :param self: This object is passed to all callbacks and you can set arbitrary values.
+    Called once after setup() in callbacks.py.
+    Initialises training-only state.
     """
-    # Example: Setup an array that will note transition tuples
-    # (s, a, r, s')
-    self.transitions = deque(maxlen=TRANSITION_HISTORY_SIZE)
+    # Buffer that collects (features, action, reward) for the current episode.
+    self.episode_transitions: deque[Transition] = deque()
+
+    self.logger.info(
+        f"Training setup complete. "
+        f"episodes_trained={self.episodes_trained}, "
+        f"epsilon={self.epsilon:.3f}"
+    )
 
 
-def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_state: dict, events: List[str]):
+def game_events_occurred(
+    self,
+    old_game_state: dict,
+    self_action: str,
+    new_game_state: dict,
+    events: List[str],
+):
     """
-    Called once per step to allow intermediate rewards based on game events.
-
-    When this method is called, self.events will contain a list of all game
-    events relevant to your agent that occurred during the previous step. Consult
-    settings.py to see what events are tracked. You can hand out rewards to your
-    agent based on these events and your knowledge of the (new) game state.
-
-    This is *one* of the places where you could update your agent.
-
-    :param self: This object is passed to all callbacks and you can set arbitrary values.
-    :param old_game_state: The state that was passed to the last call of `act`.
-    :param self_action: The action that you took.
-    :param new_game_state: The state the agent is in now.
-    :param events: The events that occurred when going from  `old_game_state` to `new_game_state`
+    Called once per step (except the last).
+    Appends one transition to the episode buffer.
     """
-    self.logger.debug(f'Encountered game event(s) {", ".join(map(repr, events))} in step {new_game_state["step"]}')
+    # -----------------------------------------------------------------------
+    # Custom events based on BFS distance change
+    # -----------------------------------------------------------------------
+    if old_game_state is not None and new_game_state is not None:
+        old_coins = old_game_state.get("coins", [])
+        new_coins = new_game_state.get("coins", [])
 
-    # Idea: Add your own events to hand out rewards
-    if ...:
-        events.append(PLACEHOLDER_EVENT)
+        if old_coins and new_coins:
+            old_pos = old_game_state["self"][3]
+            new_pos = new_game_state["self"][3]
 
-    # state_to_features is defined in callbacks.py
-    self.transitions.append(Transition(state_to_features(old_game_state), self_action, state_to_features(new_game_state), reward_from_events(self, events)))
+            # Manhattan distance to the nearest coin (cheap approximation).
+            # BFS is already used for features; we use Manhattan here just
+            # for the reward signal to keep things simple.
+            def min_manhattan(pos, coins):
+                return min(abs(pos[0] - c[0]) + abs(pos[1] - c[1]) for c in coins)
+
+            old_dist = min_manhattan(old_pos, old_coins)
+            new_dist = min_manhattan(new_pos, new_coins)
+
+            if new_dist < old_dist:
+                events.append(MOVED_TOWARD_COIN)
+            elif new_dist > old_dist:
+                events.append(MOVED_AWAY_FROM_COIN)
+
+    # -----------------------------------------------------------------------
+    # Compute reward and store transition
+    # -----------------------------------------------------------------------
+    reward = reward_from_events(self, events)
+    features = state_to_features(old_game_state)
+
+    if features is not None and self_action is not None:
+        self.episode_transitions.append(
+            Transition(features, self_action, reward)
+        )
 
 
-def end_of_round(self, last_game_state: dict, last_action: str, events: List[str]):
+def end_of_round(
+    self,
+    last_game_state: dict,
+    last_action: str,
+    events: List[str],
+):
     """
-    Called at the end of each game or when the agent died to hand out final rewards.
-    This replaces game_events_occurred in this round.
-
-    This is similar to game_events_occurred. self.events will contain all events that
-    occurred during your agent's final step.
-
-    This is *one* of the places where you could update your agent.
-    This is also a good place to store an agent that you updated.
-
-    :param self: The same object that is passed to all of your callbacks.
+    Called once at the end of each episode.
+    Performs the Monte Carlo weight update and saves the model.
     """
-    self.logger.debug(f'Encountered event(s) {", ".join(map(repr, events))} in final step')
-    self.transitions.append(Transition(state_to_features(last_game_state), last_action, None, reward_from_events(self, events)))
+    # Store the final transition (no next state in MC).
+    reward = reward_from_events(self, events)
+    features = state_to_features(last_game_state)
 
-    # Store the model
-    with open("my-saved-model.pt", "wb") as file:
-        pickle.dump(self.model, file)
+    if features is not None and last_action is not None:
+        self.episode_transitions.append(
+            Transition(features, last_action, reward)
+        )
 
+    # -----------------------------------------------------------------------
+    # Monte Carlo return calculation and weight update
+    # -----------------------------------------------------------------------
+    # Walk backwards through the episode to compute discounted returns G_t.
+    transitions = list(self.episode_transitions)
+    G = 0.0
 
-def reward_from_events(self, events: List[str]) -> int:
-    """
-    *This is not a required function, but an idea to structure your code.*
+    for transition in reversed(transitions):
+        G = transition.reward + GAMMA * G
 
-    Here you can modify the rewards your agent get so as to en/discourage
-    certain behavior.
-    """
-    game_rewards = {
-        e.COIN_COLLECTED: 1,
-        e.KILLED_OPPONENT: 5,
-        PLACEHOLDER_EVENT: -.1  # idea: the custom event is bad
+        action_index = ACTIONS.index(transition.action)
+        phi = transition.state  # feature vector
+
+        # Linear Q-value for the taken action.
+        q_current = self.model[action_index] @ phi
+
+        # Gradient descent step on the MSE loss:
+        #   w <- w + alpha * (G - Q(s,a)) * phi
+        self.model[action_index] += ALPHA * (G - q_current) * phi
+
+    self.logger.info(
+        f"Episode {self.episodes_trained + 1} complete. "
+        f"Transitions: {len(transitions)}, "
+        f"epsilon: {self.epsilon:.4f}"
+    )
+
+    # -----------------------------------------------------------------------
+    # Epsilon decay (starts after EXPLORE_EPISODES)
+    # -----------------------------------------------------------------------
+    self.episodes_trained += 1
+
+    if self.episodes_trained > EXPLORE_EPISODES:
+        self.epsilon = max(
+            EPSILON_MIN,
+            self.epsilon * EPSILON_DECAY,
+        )
+
+    # -----------------------------------------------------------------------
+    # Clear episode buffer
+    # -----------------------------------------------------------------------
+    self.episode_transitions.clear()
+
+    # -----------------------------------------------------------------------
+    # Save model
+    # -----------------------------------------------------------------------
+    saved_data = {
+        "weights": self.model,
+        "epsilon": self.epsilon,
+        "episodes_trained": self.episodes_trained,
     }
-    reward_sum = 0
-    for event in events:
-        if event in game_rewards:
-            reward_sum += game_rewards[event]
-    self.logger.info(f"Awarded {reward_sum} for events {', '.join(events)}")
-    return reward_sum
+
+    with MODEL_PATH.open("wb") as f:
+        pickle.dump(saved_data, f)
+
+    self.logger.info(f"Model saved to {MODEL_PATH}.")
+
+
+def reward_from_events(self, events: List[str]) -> float:
+    """
+    Maps game events to scalar rewards.
+    """
+    reward_map = {
+        e.COIN_COLLECTED:      REWARD_COIN_COLLECTED,
+        e.WAITED:              REWARD_WAITED,
+        e.INVALID_ACTION:      REWARD_INVALID_ACTION,
+        MOVED_TOWARD_COIN:     REWARD_MOVED_TOWARD_COIN,
+        MOVED_AWAY_FROM_COIN:  REWARD_MOVED_AWAY_FROM_COIN,
+    }
+
+    total = sum(reward_map.get(event, 0.0) for event in events)
+
+    self.logger.debug(
+        f"Reward {total:.3f} from events: {', '.join(events)}"
+    )
+
+    return total
