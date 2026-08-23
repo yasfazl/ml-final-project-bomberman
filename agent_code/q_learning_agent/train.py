@@ -36,17 +36,18 @@ PURE_EXPLORATION_EPISODES = 100
 # Reward configuration
 # ---------------------------------------------------------------------------
 
-REWARD_COIN_COLLECTED = 10.0
+REWARD_COIN_COLLECTED = 15.0
 REWARD_COIN_FOUND = 0.5
-REWARD_MOVED_TOWARD_COIN = 0.5
-REWARD_MOVED_AWAY_FROM_COIN = -0.5
+REWARD_MOVED_TOWARD_COIN = 1.0
+REWARD_MOVED_AWAY_FROM_COIN = -1.0
 
 REWARD_CRATE_DESTROYED = 2.0
 REWARD_MOVED_TOWARD_CRATE = 0.75
 REWARD_MOVED_AWAY_FROM_CRATE = -0.75
-REWARD_BOMB_TARGETED_CRATE = 1.0
+REWARD_BOMB_TARGETED_CRATE = 0.75
 REWARD_BOMB_TARGETED_OPPONENT = 4.0
 REWARD_USELESS_BOMB = -5.0
+REWARD_BOMB_WHILE_COIN_VISIBLE = -4.0
 
 REWARD_MOVED_TOWARD_SAFETY = 1.5
 REWARD_REACHED_SAFETY = 4.0
@@ -74,6 +75,7 @@ MOVED_AWAY_FROM_CRATE = "MOVED_AWAY_FROM_CRATE"
 BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
 USELESS_BOMB = "USELESS_BOMB"
+BOMB_WHILE_COIN_VISIBLE = "BOMB_WHILE_COIN_VISIBLE"
 
 MOVED_TOWARD_SAFETY = "MOVED_TOWARD_SAFETY"
 REACHED_SAFETY = "REACHED_SAFETY"
@@ -276,7 +278,9 @@ def add_bomb_placement_event(
 
     crate_count, opponent_count = bomb_target_counts(old_game_state)
 
-    if crate_count > 0:
+    # Add one event per targeted crate, so a bomb that can destroy two
+    # crates receives twice the immediate placement credit.
+    for _ in range(crate_count):
         events.append(BOMB_TARGETED_CRATE)
 
     if opponent_count > 0:
@@ -284,6 +288,9 @@ def add_bomb_placement_event(
 
     if crate_count == 0 and opponent_count == 0:
         events.append(USELESS_BOMB)
+
+    if old_game_state.get("coins", []):
+        events.append(BOMB_WHILE_COIN_VISIBLE)
 
 
 def add_crate_navigation_event(
@@ -388,6 +395,7 @@ def reward_from_events(self, events: List[str]) -> float:
         BOMB_TARGETED_CRATE: REWARD_BOMB_TARGETED_CRATE,
         BOMB_TARGETED_OPPONENT: REWARD_BOMB_TARGETED_OPPONENT,
         USELESS_BOMB: REWARD_USELESS_BOMB,
+        BOMB_WHILE_COIN_VISIBLE: REWARD_BOMB_WHILE_COIN_VISIBLE,
         MOVED_TOWARD_SAFETY: REWARD_MOVED_TOWARD_SAFETY,
         REACHED_SAFETY: REWARD_REACHED_SAFETY,
         MOVED_AWAY_FROM_SAFETY: REWARD_MOVED_AWAY_FROM_SAFETY,
