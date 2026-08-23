@@ -12,6 +12,7 @@ from .game_utils import (
     earliest_danger_times,
     has_escape_route_after_bomb,
     nearest_crate_bombing_path,
+    nearest_opponent_path,
     nearest_safe_path,
 )
 
@@ -44,7 +45,13 @@ DIRECTIONS = {
 # 26: whether a reachable safe crate-bombing tile exists
 # 27-30: first direction toward that crate-bombing tile
 # 31: normalized distance to that crate-bombing tile
-FEATURE_DIM = 32
+# 32: whether at least one opponent exists
+# 33: whether opponent pursuit is currently active
+# 34-37: first path direction toward the opponent
+# 38: normalized opponent-path distance
+FEATURE_DIM = 39
+
+OPPONENT_PURSUIT_DISTANCE = 4
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -53,8 +60,8 @@ def setup(self):
     """
     Initialize or load the Q-learning model.
 
-    Smaller compatible models are migrated to 26 features by preserving
-    their old weights and initializing new weights to zero.
+    Smaller compatible models are migrated to FEATURE_DIM features by
+    preserving their old weights and initializing new weights to zero.
     """
     self.model_path = MODEL_PATH
 
@@ -215,6 +222,9 @@ def _trace_decision(
     crate_direction, crate_distance = nearest_crate_bombing_path(
         game_state
     )
+    opponent_direction, opponent_distance = nearest_opponent_path(
+        game_state
+    )
     crate_targets, opponent_targets = bomb_target_counts(game_state)
 
     print(
@@ -224,6 +234,7 @@ def _trace_decision(
         f"bombs={game_state.get('bombs', [])} "
         f"coin={(coin_direction, coin_distance)} "
         f"crate={(crate_direction, crate_distance)} "
+        f"opponent={(opponent_direction, opponent_distance)} "
         f"escape={(escape_direction, escape_distance)} "
         f"targets={(crate_targets, opponent_targets)} "
         f"valid={valid_actions} "
@@ -374,10 +385,51 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
             1.0,
         )
 
-    # Visible coins have priority. Activating both the coin direction and
-    # crate direction at once can create conflicting Q-value signals and
-    # two-tile loops.
-    if not coins:
+    # -------------------------------------------------------------------
+    # Crate/opponent goal selection
+    # -------------------------------------------------------------------
+    # Only one navigation goal is active at a time. This prevents coin,
+    # crate, and opponent directions from producing conflicting signals.
+    field = game_state["field"]
+
+    opponent_exists = bool(game_state.get("others", []))
+    features[32] = float(opponent_exists)
+
+    opponent_direction, opponent_distance = nearest_opponent_path(
+        game_state
+    )
+    crates_exist = bool(np.any(field == 1))
+
+    # Coins have priority. Opponent pursuit is used when no coin is
+    # visible, no bomb is active, and the opponent is either nearby or
+    # there are no crates left to pursue.
+    opponent_pursuit_active = (
+        opponent_exists
+        and not coins
+        and not game_state.get("bombs", [])
+        and opponent_distance is not None
+        and (
+            opponent_distance <= OPPONENT_PURSUIT_DISTANCE
+            or not crates_exist
+        )
+    )
+
+    if opponent_pursuit_active:
+        features[33] = 1.0
+
+        if opponent_direction is not None:
+            features[34 + opponent_direction] = 1.0
+
+        if opponent_distance not in (None, 0):
+            maximum_distance = field.shape[0] + field.shape[1]
+            features[38] = min(
+                opponent_distance / maximum_distance,
+                1.0,
+            )
+
+    elif not coins:
+        # When no opponent is selected, keep using the established
+        # crate-navigation features from the stable Task 2 agent.
         crate_direction, crate_distance = nearest_crate_bombing_path(
             game_state
         )
@@ -389,7 +441,6 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
             features[27 + crate_direction] = 1.0
 
         if crate_distance not in (None, 0):
-            field = game_state["field"]
             maximum_distance = field.shape[0] + field.shape[1]
             features[31] = min(
                 crate_distance / maximum_distance,

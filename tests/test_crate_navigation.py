@@ -55,8 +55,8 @@ def test_crate_navigation_features():
 
     features = state_to_features(make_state(field, (2, 5)))
 
-    assert FEATURE_DIM == 32
-    assert features.shape == (32,)
+    assert FEATURE_DIM == 39
+    assert features.shape == (39,)
     assert features[26] == 1.0
     assert features[28] == 1.0  # RIGHT
     assert features[27] == 0.0

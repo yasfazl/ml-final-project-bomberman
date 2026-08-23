@@ -7,6 +7,7 @@ import events as e
 from .callbacks import (
     ACTIONS,
     MODEL_PATH,
+    OPPONENT_PURSUIT_DISTANCE,
     nearest_coin_path,
     state_to_features,
     valid_action_indices,
@@ -15,6 +16,7 @@ from .game_utils import (
     bomb_target_counts,
     earliest_danger_times,
     nearest_crate_bombing_path,
+    nearest_opponent_path,
     nearest_safe_path,
 )
 
@@ -44,6 +46,8 @@ REWARD_MOVED_AWAY_FROM_COIN = -1.0
 REWARD_CRATE_DESTROYED = 2.0
 REWARD_MOVED_TOWARD_CRATE = 0.75
 REWARD_MOVED_AWAY_FROM_CRATE = -0.75
+REWARD_MOVED_TOWARD_OPPONENT = 0.75
+REWARD_MOVED_AWAY_FROM_OPPONENT = -0.75
 REWARD_BOMB_TARGETED_CRATE = 0.75
 REWARD_BOMB_TARGETED_OPPONENT = 4.0
 REWARD_USELESS_BOMB = -5.0
@@ -72,6 +76,8 @@ MOVED_AWAY_FROM_COIN = "MOVED_AWAY_FROM_COIN"
 
 MOVED_TOWARD_CRATE = "MOVED_TOWARD_CRATE"
 MOVED_AWAY_FROM_CRATE = "MOVED_AWAY_FROM_CRATE"
+MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
+MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
 
 BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
@@ -111,6 +117,11 @@ def game_events_occurred(
 ):
     """Add shaped events and perform one TD Q-learning update."""
     add_coin_distance_event(old_game_state, new_game_state, events)
+    add_opponent_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
     add_crate_navigation_event(old_game_state, new_game_state, events)
     add_bomb_placement_event(old_game_state, self_action, events)
     add_waiting_event(old_game_state, self_action, events)
@@ -296,6 +307,72 @@ def add_bomb_placement_event(
         events.append(BOMB_WHILE_COIN_VISIBLE)
 
 
+def _opponent_pursuit_is_active(game_state: dict | None) -> bool:
+    """Return whether opponent pursuit is the current navigation goal."""
+    if game_state is None:
+        return False
+
+    if game_state.get("coins", []):
+        return False
+
+    if game_state.get("bombs", []):
+        return False
+
+    if not game_state.get("others", []):
+        return False
+
+    _direction, distance = nearest_opponent_path(game_state)
+
+    if distance is None:
+        return False
+
+    crates_exist = bool(np.any(game_state["field"] == 1))
+
+    return (
+        distance <= OPPONENT_PURSUIT_DISTANCE
+        or not crates_exist
+    )
+
+
+def add_opponent_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+):
+    """
+    Reward progress toward the currently selected opponent.
+
+    Opponents are frozen at their old observed positions for this
+    comparison. This prevents an opponent's own movement from being
+    incorrectly rewarded as progress made by our agent.
+    """
+    if old_game_state is None or new_game_state is None:
+        return
+
+    if not _opponent_pursuit_is_active(old_game_state):
+        return
+
+    old_distance = nearest_opponent_path(old_game_state)[1]
+
+    if old_distance is None:
+        return
+
+    comparison_state = dict(old_game_state)
+    comparison_agent = list(old_game_state["self"])
+    comparison_agent[3] = tuple(new_game_state["self"][3])
+    comparison_state["self"] = tuple(comparison_agent)
+
+    new_distance = nearest_opponent_path(comparison_state)[1]
+
+    if new_distance is None:
+        return
+
+    if new_distance < old_distance:
+        events.append(MOVED_TOWARD_OPPONENT)
+    elif new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_OPPONENT)
+
+
 def add_crate_navigation_event(
     old_game_state: dict,
     new_game_state: dict,
@@ -307,6 +384,13 @@ def add_crate_navigation_event(
 
     # A visible coin is a more immediate target.
     if old_game_state.get("coins", []):
+        return
+
+    # Do not activate crate and opponent shaping simultaneously.
+    if (
+        _opponent_pursuit_is_active(old_game_state)
+        or _opponent_pursuit_is_active(new_game_state)
+    ):
         return
 
     # Escape rewards take control while bombs are active.
@@ -361,8 +445,11 @@ def add_waiting_event(
 
     has_coin_goal = coin_distance is not None
     has_crate_goal = crate_distance is not None
+    has_opponent_goal = _opponent_pursuit_is_active(
+        old_game_state
+    )
 
-    if has_coin_goal or has_crate_goal:
+    if has_coin_goal or has_crate_goal or has_opponent_goal:
         events.append(WAITED_WITH_GOAL)
 
 
@@ -420,6 +507,8 @@ def reward_from_events(self, events: List[str]) -> float:
         MOVED_AWAY_FROM_COIN: REWARD_MOVED_AWAY_FROM_COIN,
         MOVED_TOWARD_CRATE: REWARD_MOVED_TOWARD_CRATE,
         MOVED_AWAY_FROM_CRATE: REWARD_MOVED_AWAY_FROM_CRATE,
+        MOVED_TOWARD_OPPONENT: REWARD_MOVED_TOWARD_OPPONENT,
+        MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
         BOMB_TARGETED_CRATE: REWARD_BOMB_TARGETED_CRATE,
         BOMB_TARGETED_OPPONENT: REWARD_BOMB_TARGETED_OPPONENT,
         USELESS_BOMB: REWARD_USELESS_BOMB,

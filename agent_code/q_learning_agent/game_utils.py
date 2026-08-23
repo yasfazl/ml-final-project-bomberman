@@ -388,3 +388,141 @@ def nearest_crate_bombing_path(
             )
 
     return None, None
+
+
+
+
+def nearest_opponent_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """
+    Find the shortest path to a free tile adjacent to an opponent.
+
+    Returns:
+        first_direction:
+            0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
+
+        distance:
+            number of movements required
+
+    Special values:
+        (None, 0):
+            the agent is already adjacent to an opponent
+
+        (None, None):
+            no opponent can currently be reached
+    """
+    field = game_state["field"]
+    start_position = tuple(game_state["self"][3])
+
+    opponent_positions = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+
+    if not opponent_positions:
+        return None, None
+
+    bomb_positions = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+
+    blocked_positions = (
+        opponent_positions | bomb_positions
+    )
+
+    width, height = field.shape
+    target_positions = set()
+
+    # We cannot enter an opponent's tile, so target one of its
+    # reachable neighbouring floor tiles.
+    for opponent_x, opponent_y in opponent_positions:
+        for dx, dy in DIRECTIONS:
+            target_position = (
+                opponent_x + dx,
+                opponent_y + dy,
+            )
+            x, y = target_position
+
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+
+            if field[target_position] != 0:
+                continue
+
+            if target_position in blocked_positions:
+                continue
+
+            target_positions.add(target_position)
+
+    if not target_positions:
+        return None, None
+
+    if start_position in target_positions:
+        return None, 0
+
+    # Queue entries:
+    # (position, first_direction, distance)
+    queue = [
+        (
+            start_position,
+            None,
+            0,
+        )
+    ]
+    queue_index = 0
+    visited = {start_position}
+
+    while queue_index < len(queue):
+        position, first_direction, distance = queue[queue_index]
+        queue_index += 1
+
+        x, y = position
+
+        for direction_index, (dx, dy) in enumerate(DIRECTIONS):
+            next_position = (
+                x + dx,
+                y + dy,
+            )
+
+            if next_position in visited:
+                continue
+
+            if next_position in blocked_positions:
+                continue
+
+            next_x, next_y = next_position
+
+            if not (
+                0 <= next_x < width
+                and 0 <= next_y < height
+            ):
+                continue
+
+            if field[next_position] != 0:
+                continue
+
+            next_first_direction = (
+                direction_index
+                if first_direction is None
+                else first_direction
+            )
+            next_distance = distance + 1
+
+            if next_position in target_positions:
+                return (
+                    next_first_direction,
+                    next_distance,
+                )
+
+            visited.add(next_position)
+            queue.append(
+                (
+                    next_position,
+                    next_first_direction,
+                    next_distance,
+                )
+            )
+
+    return None, None
