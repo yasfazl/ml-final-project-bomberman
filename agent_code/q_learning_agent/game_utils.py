@@ -50,3 +50,36 @@ def blast_tiles(
                 break
 
     return affected_tiles
+
+def earliest_danger_times(
+    game_state: dict,
+) -> np.ndarray:
+    """
+    Return the earliest explosion time for every board tile.
+
+    np.inf means the tile is currently not threatened.
+    0 means an explosion is already active.
+    """
+    field = game_state["field"]
+
+    danger_times = np.full(
+        field.shape,
+        np.inf,
+        dtype=np.float64,
+    )
+
+    explosion_map = game_state.get("explosion_map")
+
+    if explosion_map is not None:
+        danger_times[
+            np.asarray(explosion_map) > 0
+        ] = 0.0
+
+    for bomb_position, timer in game_state.get("bombs", []):
+        for position in blast_tiles(field, bomb_position):
+            danger_times[position] = min(
+                danger_times[position],
+                float(timer),
+            )
+
+    return danger_times
