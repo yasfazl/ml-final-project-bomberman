@@ -58,9 +58,10 @@ REWARD_MOVED_INTO_TRAP = -8.0
 REWARD_KILLED_OPPONENT = 20.0
 REWARD_KILLED_SELF = -30.0
 REWARD_GOT_KILLED = -20.0
-REWARD_SURVIVED_ROUND = 5.0
+REWARD_SURVIVED_ROUND = 0.0
 
 REWARD_WAITED = -0.2
+REWARD_WAITED_WITH_GOAL = -2.0
 REWARD_INVALID_ACTION = -2.0
 STEP_PENALTY = -0.05
 
@@ -76,6 +77,7 @@ BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
 USELESS_BOMB = "USELESS_BOMB"
 BOMB_WHILE_COIN_VISIBLE = "BOMB_WHILE_COIN_VISIBLE"
+WAITED_WITH_GOAL = "WAITED_WITH_GOAL"
 
 MOVED_TOWARD_SAFETY = "MOVED_TOWARD_SAFETY"
 REACHED_SAFETY = "REACHED_SAFETY"
@@ -111,6 +113,7 @@ def game_events_occurred(
     add_coin_distance_event(old_game_state, new_game_state, events)
     add_crate_navigation_event(old_game_state, new_game_state, events)
     add_bomb_placement_event(old_game_state, self_action, events)
+    add_waiting_event(old_game_state, self_action, events)
     add_escape_events(
         old_game_state,
         self_action,
@@ -339,6 +342,30 @@ def _current_position_is_dangerous(game_state: dict) -> bool:
     return not np.isinf(danger_times[position])
 
 
+def add_waiting_event(
+    old_game_state: dict,
+    action: str,
+    events: List[str],
+):
+    """Penalize avoidable waiting while a reachable goal exists."""
+    if old_game_state is None or action != "WAIT":
+        return
+
+    # Waiting can be necessary after escaping while a bomb finishes its
+    # countdown, so do not add the goal penalty during active bombs.
+    if old_game_state.get("bombs", []):
+        return
+
+    coin_distance = nearest_coin_path(old_game_state)[1]
+    crate_distance = nearest_crate_bombing_path(old_game_state)[1]
+
+    has_coin_goal = coin_distance is not None
+    has_crate_goal = crate_distance is not None
+
+    if has_coin_goal or has_crate_goal:
+        events.append(WAITED_WITH_GOAL)
+
+
 def add_escape_events(
     old_game_state: dict,
     action: str,
@@ -387,6 +414,7 @@ def reward_from_events(self, events: List[str]) -> float:
         e.GOT_KILLED: REWARD_GOT_KILLED,
         e.SURVIVED_ROUND: REWARD_SURVIVED_ROUND,
         e.WAITED: REWARD_WAITED,
+        WAITED_WITH_GOAL: REWARD_WAITED_WITH_GOAL,
         e.INVALID_ACTION: REWARD_INVALID_ACTION,
         MOVED_TOWARD_COIN: REWARD_MOVED_TOWARD_COIN,
         MOVED_AWAY_FROM_COIN: REWARD_MOVED_AWAY_FROM_COIN,
