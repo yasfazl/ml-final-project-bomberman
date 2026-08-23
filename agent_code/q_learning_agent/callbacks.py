@@ -374,23 +374,27 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
             1.0,
         )
 
-    crate_direction, crate_distance = nearest_crate_bombing_path(
-        game_state
-    )
-
-    if crate_distance is not None:
-        features[26] = 1.0
-
-    if crate_direction is not None:
-        features[27 + crate_direction] = 1.0
-
-    if crate_distance not in (None, 0):
-        field = game_state["field"]
-        maximum_distance = field.shape[0] + field.shape[1]
-        features[31] = min(
-            crate_distance / maximum_distance,
-            1.0,
+    # Visible coins have priority. Activating both the coin direction and
+    # crate direction at once can create conflicting Q-value signals and
+    # two-tile loops.
+    if not coins:
+        crate_direction, crate_distance = nearest_crate_bombing_path(
+            game_state
         )
+
+        if crate_distance is not None:
+            features[26] = 1.0
+
+        if crate_direction is not None:
+            features[27 + crate_direction] = 1.0
+
+        if crate_distance not in (None, 0):
+            field = game_state["field"]
+            maximum_distance = field.shape[0] + field.shape[1]
+            features[31] = min(
+                crate_distance / maximum_distance,
+                1.0,
+            )
 
     return features
 

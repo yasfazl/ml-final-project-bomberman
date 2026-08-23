@@ -1,3 +1,4 @@
+
 import numpy as np
 
 from agent_code.q_learning_agent.callbacks import (
@@ -90,3 +91,15 @@ def test_penalty_for_moving_away_from_crate_target():
     )
 
     assert MOVED_AWAY_FROM_CRATE in events
+
+
+def test_visible_coin_disables_crate_navigation_features():
+    field = open_field()
+    field[8, 5] = 1
+    state = make_state(field, (2, 5))
+    state["coins"] = [(2, 7)]
+
+    features = state_to_features(state)
+
+    assert features[5] == 1.0
+    assert np.allclose(features[26:32], 0.0)
