@@ -1,5 +1,6 @@
 from collections import deque
 from pathlib import Path
+import os
 import pickle
 import random
 
@@ -10,6 +11,7 @@ from .game_utils import (
     bomb_target_counts,
     earliest_danger_times,
     has_escape_route_after_bomb,
+    nearest_crate_bombing_path,
     nearest_safe_path,
 )
 
@@ -39,7 +41,10 @@ DIRECTIONS = {
 # 20: whether an opponent would be hit by a bomb placed here
 # 21-24: first direction of the shortest safe escape path
 # 25: normalized distance along that escape path
-FEATURE_DIM = 26
+# 26: whether a reachable safe crate-bombing tile exists
+# 27-30: first direction toward that crate-bombing tile
+# 31: normalized distance to that crate-bombing tile
+FEATURE_DIM = 32
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -139,11 +144,20 @@ def act(self, game_state: dict) -> str:
 
     if self.train and random.random() < self.epsilon:
         action_index = random.choice(valid_indices)
+        chosen_action = ACTIONS[action_index]
         self.logger.debug(
-            f"Exploration: selected {ACTIONS[action_index]} "
+            f"Exploration: selected {chosen_action} "
             f"with epsilon={self.epsilon:.3f}"
         )
-        return ACTIONS[action_index]
+        _trace_decision(
+            game_state,
+            features,
+            valid_indices,
+            None,
+            chosen_action,
+            "explore",
+        )
+        return chosen_action
 
     q_values = self.model @ features
 
@@ -155,13 +169,69 @@ def act(self, game_state: dict) -> str:
         np.isclose(masked_q_values, best_q_value)
     )
     action_index = int(np.random.choice(best_indices))
+    chosen_action = ACTIONS[action_index]
 
     self.logger.debug(
-        f"Exploitation: selected {ACTIONS[action_index]}, "
+        f"Exploitation: selected {chosen_action}, "
         f"Q-values={q_values}"
     )
 
-    return ACTIONS[action_index]
+    _trace_decision(
+        game_state,
+        features,
+        valid_indices,
+        q_values,
+        chosen_action,
+        "exploit",
+    )
+
+    return chosen_action
+
+
+def _trace_decision(
+    game_state: dict,
+    features: np.ndarray,
+    valid_indices: list[int],
+    q_values: np.ndarray | None,
+    chosen_action: str,
+    mode: str,
+):
+    """Print one diagnostic line when BOMBERMAN_TRACE=1."""
+    if os.environ.get("BOMBERMAN_TRACE") != "1":
+        return
+
+    valid_actions = [ACTIONS[index] for index in valid_indices]
+
+    if q_values is None:
+        valid_q_values = {}
+    else:
+        valid_q_values = {
+            ACTIONS[index]: round(float(q_values[index]), 3)
+            for index in valid_indices
+        }
+
+    coin_direction, coin_distance = nearest_coin_path(game_state)
+    escape_direction, escape_distance = nearest_safe_path(game_state)
+    crate_direction, crate_distance = nearest_crate_bombing_path(
+        game_state
+    )
+    crate_targets, opponent_targets = bomb_target_counts(game_state)
+
+    print(
+        "[TRACE] "
+        f"step={game_state.get('step')} "
+        f"position={tuple(game_state['self'][3])} "
+        f"bombs={game_state.get('bombs', [])} "
+        f"coin={(coin_direction, coin_distance)} "
+        f"crate={(crate_direction, crate_distance)} "
+        f"escape={(escape_direction, escape_distance)} "
+        f"targets={(crate_targets, opponent_targets)} "
+        f"valid={valid_actions} "
+        f"q={valid_q_values} "
+        f"mode={mode} "
+        f"chosen={chosen_action}",
+        flush=True,
+    )
 
 
 def valid_action_indices(game_state: dict) -> list[int]:
@@ -301,6 +371,24 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
     if escape_distance not in (None, 0):
         features[25] = min(
             escape_distance / max(float(s.BOMB_TIMER), 1.0),
+            1.0,
+        )
+
+    crate_direction, crate_distance = nearest_crate_bombing_path(
+        game_state
+    )
+
+    if crate_distance is not None:
+        features[26] = 1.0
+
+    if crate_direction is not None:
+        features[27 + crate_direction] = 1.0
+
+    if crate_distance not in (None, 0):
+        field = game_state["field"]
+        maximum_distance = field.shape[0] + field.shape[1]
+        features[31] = min(
+            crate_distance / maximum_distance,
             1.0,
         )
 

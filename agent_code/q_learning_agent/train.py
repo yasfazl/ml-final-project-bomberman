@@ -14,6 +14,7 @@ from .callbacks import (
 from .game_utils import (
     bomb_target_counts,
     earliest_danger_times,
+    nearest_crate_bombing_path,
     nearest_safe_path,
 )
 
@@ -41,6 +42,8 @@ REWARD_MOVED_TOWARD_COIN = 0.5
 REWARD_MOVED_AWAY_FROM_COIN = -0.5
 
 REWARD_CRATE_DESTROYED = 2.0
+REWARD_MOVED_TOWARD_CRATE = 0.75
+REWARD_MOVED_AWAY_FROM_CRATE = -0.75
 REWARD_BOMB_TARGETED_CRATE = 1.0
 REWARD_BOMB_TARGETED_OPPONENT = 4.0
 REWARD_USELESS_BOMB = -5.0
@@ -64,6 +67,9 @@ STEP_PENALTY = -0.05
 # Custom events
 MOVED_TOWARD_COIN = "MOVED_TOWARD_COIN"
 MOVED_AWAY_FROM_COIN = "MOVED_AWAY_FROM_COIN"
+
+MOVED_TOWARD_CRATE = "MOVED_TOWARD_CRATE"
+MOVED_AWAY_FROM_CRATE = "MOVED_AWAY_FROM_CRATE"
 
 BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
@@ -101,6 +107,7 @@ def game_events_occurred(
 ):
     """Add shaped events and perform one TD Q-learning update."""
     add_coin_distance_event(old_game_state, new_game_state, events)
+    add_crate_navigation_event(old_game_state, new_game_state, events)
     add_bomb_placement_event(old_game_state, self_action, events)
     add_escape_events(
         old_game_state,
@@ -279,6 +286,43 @@ def add_bomb_placement_event(
         events.append(USELESS_BOMB)
 
 
+def add_crate_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+):
+    """Reward progress toward a reachable safe crate-bombing tile."""
+    if old_game_state is None or new_game_state is None:
+        return
+
+    # A visible coin is a more immediate target.
+    if old_game_state.get("coins", []):
+        return
+
+    # Escape rewards take control while bombs are active.
+    if old_game_state.get("bombs", []) or new_game_state.get("bombs", []):
+        return
+
+    # A destroyed crate changes the target set, so distances are not
+    # comparable across that transition.
+    if not np.array_equal(
+        old_game_state["field"],
+        new_game_state["field"],
+    ):
+        return
+
+    old_distance = nearest_crate_bombing_path(old_game_state)[1]
+    new_distance = nearest_crate_bombing_path(new_game_state)[1]
+
+    if old_distance is None or new_distance is None:
+        return
+
+    if new_distance < old_distance:
+        events.append(MOVED_TOWARD_CRATE)
+    elif new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_CRATE)
+
+
 def _current_position_is_dangerous(game_state: dict) -> bool:
     if game_state is None:
         return False
@@ -339,6 +383,8 @@ def reward_from_events(self, events: List[str]) -> float:
         e.INVALID_ACTION: REWARD_INVALID_ACTION,
         MOVED_TOWARD_COIN: REWARD_MOVED_TOWARD_COIN,
         MOVED_AWAY_FROM_COIN: REWARD_MOVED_AWAY_FROM_COIN,
+        MOVED_TOWARD_CRATE: REWARD_MOVED_TOWARD_CRATE,
+        MOVED_AWAY_FROM_CRATE: REWARD_MOVED_AWAY_FROM_CRATE,
         BOMB_TARGETED_CRATE: REWARD_BOMB_TARGETED_CRATE,
         BOMB_TARGETED_OPPONENT: REWARD_BOMB_TARGETED_OPPONENT,
         USELESS_BOMB: REWARD_USELESS_BOMB,
