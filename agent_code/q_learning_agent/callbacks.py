@@ -4,8 +4,14 @@ import pickle
 import random
 
 import numpy as np
+import settings as s
 
-from .game_utils import earliest_danger_times
+from .game_utils import (
+    bomb_target_counts,
+    earliest_danger_times,
+    has_escape_route_after_bomb,
+    nearest_safe_path,
+)
 
 
 ACTIONS = ["UP", "RIGHT", "DOWN", "LEFT", "WAIT", "BOMB"]
@@ -27,9 +33,13 @@ DIRECTIONS = {
 # 10: normalized distance to the nearest reachable coin
 # 11: danger urgency at the current position
 # 12-16: danger urgency after UP, RIGHT, DOWN, LEFT, WAIT
-FEATURE_DIM = 17
-
-LEGACY_FEATURE_DIM = 11
+# 17: whether the agent currently has a bomb available
+# 18: whether placing a bomb leaves a timed escape route
+# 19: normalized number of crates hit by a bomb placed here
+# 20: whether an opponent would be hit by a bomb placed here
+# 21-24: first direction of the shortest safe escape path
+# 25: normalized distance along that escape path
+FEATURE_DIM = 26
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -38,9 +48,8 @@ def setup(self):
     """
     Initialize or load the Q-learning model.
 
-    Existing 11-feature Task 1 models are migrated to 17 features by
-    preserving their old weights and initializing the new danger weights
-    to zero.
+    Smaller compatible models are migrated to 26 features by preserving
+    their old weights and initializing new weights to zero.
     """
     self.model_path = MODEL_PATH
 
@@ -64,24 +73,36 @@ def setup(self):
             dtype=np.float64,
         )
 
-        expected_shape = (len(ACTIONS), FEATURE_DIM)
-        legacy_shape = (len(ACTIONS), LEGACY_FEATURE_DIM)
+        if saved_weights.ndim != 2:
+            raise ValueError(
+                f"Expected a two-dimensional model, found "
+                f"shape {saved_weights.shape}."
+            )
 
-        if saved_weights.shape == legacy_shape:
+        if saved_weights.shape[0] != len(ACTIONS):
+            raise ValueError(
+                f"Expected {len(ACTIONS)} action rows, found "
+                f"shape {saved_weights.shape}."
+            )
+
+        if saved_weights.shape[1] > FEATURE_DIM:
+            raise ValueError(
+                f"Saved model has {saved_weights.shape[1]} features, "
+                f"but this agent expects {FEATURE_DIM}."
+            )
+
+        if saved_weights.shape[1] < FEATURE_DIM:
+            old_feature_dimension = saved_weights.shape[1]
             migrated_weights = np.zeros(
-                expected_shape,
+                (len(ACTIONS), FEATURE_DIM),
                 dtype=np.float64,
             )
-            migrated_weights[:, :LEGACY_FEATURE_DIM] = saved_weights
+            migrated_weights[:, :old_feature_dimension] = saved_weights
             saved_weights = migrated_weights
 
             self.logger.info(
-                "Migrated Task 1 model from 11 to 17 features."
-            )
-        elif saved_weights.shape != expected_shape:
-            raise ValueError(
-                f"Expected model shape {expected_shape} or "
-                f"{legacy_shape}, but found {saved_weights.shape}."
+                f"Migrated model from {old_feature_dimension} "
+                f"to {FEATURE_DIM} features."
             )
 
         self.model = saved_weights
@@ -145,9 +166,12 @@ def act(self, game_state: dict) -> str:
 
 def valid_action_indices(game_state: dict) -> list[int]:
     """
-    Return physically legal actions.
+    Return physically legal actions plus safe, useful bomb placement.
 
-    BOMB remains disabled until the escape-route check is implemented.
+    BOMB is allowed only when:
+    - the agent has a bomb available;
+    - at least one crate or opponent is in the blast;
+    - a time-aware escape route exists.
     """
     field = game_state["field"]
     x, y = game_state["self"][3]
@@ -174,6 +198,13 @@ def valid_action_indices(game_state: dict) -> list[int]:
             valid_indices.append(action_index)
 
     valid_indices.append(ACTIONS.index("WAIT"))
+
+    if bool(game_state["self"][2]):
+        crate_count, opponent_count = bomb_target_counts(game_state)
+        has_target = crate_count > 0 or opponent_count > 0
+
+        if has_target and has_escape_route_after_bomb(game_state):
+            valid_indices.append(ACTIONS.index("BOMB"))
 
     return valid_indices
 
@@ -250,6 +281,28 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
             features[12 + feature_offset] = danger_urgency(
                 danger_times[next_position]
             )
+
+    bomb_available = bool(game_state["self"][2])
+    features[17] = float(bomb_available)
+
+    if bomb_available:
+        safe_bomb = has_escape_route_after_bomb(game_state)
+        crate_count, opponent_count = bomb_target_counts(game_state)
+
+        features[18] = float(safe_bomb)
+        features[19] = min(crate_count / 4.0, 1.0)
+        features[20] = float(opponent_count > 0)
+
+    escape_direction, escape_distance = nearest_safe_path(game_state)
+
+    if escape_direction is not None:
+        features[21 + escape_direction] = 1.0
+
+    if escape_distance not in (None, 0):
+        features[25] = min(
+            escape_distance / max(float(s.BOMB_TIMER), 1.0),
+            1.0,
+        )
 
     return features
 
