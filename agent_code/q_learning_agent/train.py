@@ -1,4 +1,5 @@
-# Local one-step crate-efficiency fine-tuning (version 2).
+# Local crate-efficiency fine-tuning with five-step n-step updates.
+from collections import deque
 from typing import List
 import pickle
 
@@ -27,6 +28,7 @@ from .game_utils import (
 
 ALPHA = 0.01
 GAMMA = 0.90
+N_STEP = 5
 
 EPSILON_START = 1.0
 EPSILON_MIN = 0.05
@@ -120,6 +122,7 @@ def setup_training(self):
     self.round_reward = 0.0
     self.round_td_errors = []
     self.training_steps = 0
+    self.transition_buffer = deque()
 
     # Protect the already-good coin, bomb, and escape behaviour. The model
     # still uses every feature for Q-value calculation, but gradient updates
@@ -151,7 +154,7 @@ def game_events_occurred(
     new_game_state: dict,
     events: List[str],
 ):
-    """Add shaped events and perform one TD Q-learning update."""
+    """Add shaped events and queue one transition for n-step Q-learning."""
     add_coin_distance_event(old_game_state, new_game_state, events)
     add_crate_navigation_event(old_game_state, new_game_state, events)
     add_crate_efficiency_navigation_event(
@@ -170,13 +173,24 @@ def game_events_occurred(
 
     reward = reward_from_events(self, events)
 
-    td_error = update_q_learning(
-        self=self,
-        old_game_state=old_game_state,
-        action=self_action,
-        new_game_state=new_game_state,
-        reward=reward,
-    )
+    transition = {
+        "old_game_state": old_game_state,
+        "action": self_action,
+        "reward": reward,
+        "new_game_state": new_game_state,
+        "terminal": new_game_state is None,
+    }
+
+    self.transition_buffer.append(transition)
+
+    td_error = None
+
+    if len(self.transition_buffer) >= N_STEP:
+        td_error = update_q_learning(
+            self=self,
+            transitions=list(self.transition_buffer)[:N_STEP],
+        )
+        self.transition_buffer.popleft()
 
     self.round_reward += reward
     self.training_steps += 1
@@ -196,18 +210,32 @@ def end_of_round(
     last_action: str,
     events: List[str],
 ):
-    """Handle the terminal update, epsilon decay, and model saving."""
+    """Append the terminal transition, flush the buffer, and save."""
     add_bomb_placement_event(last_game_state, last_action, events)
 
     reward = reward_from_events(self, events)
 
-    td_error = update_q_learning(
-        self=self,
-        old_game_state=last_game_state,
-        action=last_action,
-        new_game_state=None,
-        reward=reward,
-    )
+    terminal_transition = {
+        "old_game_state": last_game_state,
+        "action": last_action,
+        "reward": reward,
+        "new_game_state": None,
+        "terminal": True,
+    }
+
+    self.transition_buffer.append(terminal_transition)
+
+    td_error = None
+
+    while self.transition_buffer:
+        td_error = update_q_learning(
+            self=self,
+            transitions=list(self.transition_buffer)[: min(
+                N_STEP,
+                len(self.transition_buffer),
+            )],
+        )
+        self.transition_buffer.popleft()
 
     self.round_reward += reward
 
@@ -244,20 +272,43 @@ def end_of_round(
 
 def update_q_learning(
     self,
-    old_game_state: dict,
-    action: str,
-    new_game_state: dict | None,
-    reward: float,
+    transitions: List[dict] | None = None,
+    old_game_state: dict | None = None,
+    action: str | None = None,
+    new_game_state: dict | None = None,
+    reward: float | None = None,
 ) -> float | None:
-    """Apply one semi-gradient linear Q-learning update.
+    """Apply one semi-gradient linear n-step Q-learning update.
 
     During crate-efficiency fine-tuning, Q-values still use the complete
     model, while only columns 32 onward receive gradient updates. This keeps
     the trained Task 2 behaviour bit-for-bit unchanged in columns 0-31.
 
-    Tests and optional fresh training can omit ``freeze_base_features`` to
-    retain the original full-model update behaviour.
+    ``transitions`` must contain the oldest transition first.
+    The legacy one-step keyword arguments are still accepted for tests and
+    external callers, but they are converted into a single transition.
     """
+    if transitions is None:
+        if old_game_state is None:
+            return None
+
+        transitions = [
+            {
+                "old_game_state": old_game_state,
+                "action": action,
+                "reward": 0.0 if reward is None else reward,
+                "new_game_state": new_game_state,
+                "terminal": new_game_state is None,
+            }
+        ]
+
+    if not transitions:
+        return None
+
+    transition = transitions[0]
+    old_game_state = transition["old_game_state"]
+    action = transition["action"]
+
     if old_game_state is None:
         return None
 
@@ -273,17 +324,10 @@ def update_q_learning(
     action_index = ACTIONS.index(action)
     current_q_value = float(self.model[action_index] @ features)
 
-    if new_game_state is None:
-        target = reward
-    else:
-        next_features = state_to_features(new_game_state)
-        next_valid_indices = valid_action_indices(new_game_state)
-        next_q_values = self.model @ next_features
-
-        best_next_q_value = float(
-            np.max(next_q_values[next_valid_indices])
-        )
-        target = reward + GAMMA * best_next_q_value
+    target = _n_step_target(
+        self=self,
+        transitions=transitions,
+    )
 
     td_error = target - current_q_value
 
@@ -309,6 +353,47 @@ def update_q_learning(
         )
 
     return float(td_error)
+
+
+def _n_step_target(
+    self,
+    transitions: List[dict],
+) -> float:
+    """Compute the discounted return for the oldest buffered transition."""
+    target = 0.0
+
+    for step_index, transition in enumerate(transitions):
+        target += (GAMMA**step_index) * float(transition["reward"])
+
+        if transition["terminal"]:
+            return float(target)
+
+    if len(transitions) < N_STEP:
+        return float(target)
+
+    final_next_state = transitions[-1]["new_game_state"]
+
+    if final_next_state is None:
+        return float(target)
+
+    next_features = state_to_features(final_next_state)
+
+    if next_features is None:
+        return float(target)
+
+    next_valid_indices = valid_action_indices(final_next_state)
+
+    if not next_valid_indices:
+        return float(target)
+
+    next_q_values = self.model @ next_features
+    best_next_q_value = float(
+        np.max(next_q_values[next_valid_indices])
+    )
+
+    target += (GAMMA**N_STEP) * best_next_q_value
+
+    return float(target)
 
 
 def add_coin_distance_event(
@@ -458,9 +543,15 @@ def add_crate_efficiency_navigation_event(
         old_best_crate_count,
     ) = best_crate_bombing_path(old_game_state)
 
-    old_current_crate_count, _old_opponent_count = bomb_target_counts(
+    old_current_crate_count, old_opponent_count = bomb_target_counts(
         old_game_state
     )
+    _new_current_crate_count, new_opponent_count = bomb_target_counts(
+        new_game_state
+    )
+
+    if old_opponent_count > 0 or new_opponent_count > 0:
+        return
 
     old_has_better_position = (
         old_distance not in (None, 0)
@@ -611,7 +702,7 @@ def save_model(self):
         "epsilon": self.epsilon,
         "episodes_trained": self.episodes_trained,
         "feature_dim": int(self.model.shape[1]),
-        "training_stage": "local_crate_efficiency_fine_tuning_v2",
+        "training_stage": "five_step_crate_efficiency_v3",
     }
 
     temporary_path = MODEL_PATH.with_suffix(".tmp")

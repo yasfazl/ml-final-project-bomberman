@@ -15,11 +15,11 @@ def open_field(size=9):
     return field
 
 
-def make_state(field, coins=(), bombs=()):
+def make_state(field, coins=(), bombs=(), others=()):
     return {
         "field": field,
         "self": ("q_learning_agent", 0, True, (4, 4)),
-        "others": [],
+        "others": list(others),
         "bombs": list(bombs),
         "coins": list(coins),
         "explosion_map": np.zeros_like(field),
@@ -68,6 +68,32 @@ def test_visible_coin_disables_efficiency_features():
     )
 
     assert np.allclose(features[32:39], 0.0)
+
+
+def test_opponent_target_disables_efficiency_features():
+    features = state_to_features(
+        make_state(
+            efficient_crate_field(),
+            others=[("opponent", 0, True, (4, 3))],
+        )
+    )
+
+    assert np.allclose(features[32:39], 0.0)
+
+
+def test_distant_opponent_keeps_efficiency_features_active():
+    features = state_to_features(
+        make_state(
+            efficient_crate_field(),
+            others=[("opponent", 0, True, (1, 1))],
+        )
+    )
+
+    assert features[32] == 1.0
+    assert features[36] == 1.0
+    assert np.sum(features[33:37]) == 1.0
+    assert np.isclose(features[37], 1.0 / 18.0)
+    assert np.isclose(features[38], 2.0 / 4.0)
 
 
 def test_current_best_position_has_yield_without_move_direction():

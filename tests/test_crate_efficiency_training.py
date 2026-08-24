@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import numpy as np
 
 import events as e
+from agent_code.q_learning_agent import train as train_module
 from agent_code.q_learning_agent.callbacks import (
     ACTIONS,
     FEATURE_DIM,
@@ -64,6 +65,39 @@ def make_state(position=(4, 4), field=None):
     }
 
 
+def make_transition(
+    step,
+    reward=1.0,
+    action="LEFT",
+    terminal=False,
+    field=None,
+    position=(4, 4),
+    next_position=(4, 4),
+):
+    old_game_state = make_state(
+        position=position,
+        field=field,
+    )
+    old_game_state["step"] = step
+
+    new_game_state = None
+
+    if not terminal:
+        new_game_state = make_state(
+            position=next_position,
+            field=field,
+        )
+        new_game_state["step"] = step + 1
+
+    return {
+        "old_game_state": old_game_state,
+        "action": action,
+        "reward": reward,
+        "new_game_state": new_game_state,
+        "terminal": terminal,
+    }
+
+
 def test_moving_toward_better_bomb_spot_adds_event():
     events = []
 
@@ -75,6 +109,32 @@ def test_moving_toward_better_bomb_spot_adds_event():
 
     assert MOVED_TOWARD_BETTER_BOMB_SPOT in events
     assert MOVED_AWAY_FROM_BETTER_BOMB_SPOT not in events
+
+
+def test_opponent_targets_block_crate_efficiency_navigation_events():
+    field = efficient_crate_field()
+
+    old_game_state = make_state(position=(4, 4), field=field)
+    new_game_state = make_state(position=(3, 4), field=field)
+    old_game_state["others"] = [("opponent", 0, False, (4, 3))]
+    events = []
+    add_crate_efficiency_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
+    assert not events
+
+    old_game_state = make_state(position=(4, 4), field=field)
+    new_game_state = make_state(position=(3, 4), field=field)
+    new_game_state["others"] = [("opponent", 0, False, (3, 3))]
+    events = []
+    add_crate_efficiency_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
+    assert not events
 
 
 def test_moving_away_from_better_bomb_spot_adds_event():
@@ -113,12 +173,20 @@ def test_fine_tuning_preserves_original_feature_weights():
     setup_training(fake_self)
     weights_before = fake_self.model.copy()
 
+    transitions = [
+        make_transition(
+            step=index + 1,
+            reward=1.0,
+            action="LEFT",
+            terminal=(index == 4),
+            field=efficient_crate_field(),
+        )
+        for index in range(5)
+    ]
+
     update_q_learning(
         self=fake_self,
-        old_game_state=make_state(position=(4, 4)),
-        action="LEFT",
-        new_game_state=None,
-        reward=2.0,
+        transitions=transitions,
     )
 
     action_index = ACTIONS.index("LEFT")
@@ -133,3 +201,143 @@ def test_fine_tuning_preserves_original_feature_weights():
             BASE_FEATURE_DIM:,
         ] != 0.0
     )
+
+
+def test_exact_five_step_return_uses_bootstrap():
+    fake_self = SimpleNamespace(
+        logger=Logger(),
+        model=np.zeros((len(ACTIONS), FEATURE_DIM)),
+        epsilon=0.2,
+        episodes_trained=1000,
+    )
+
+    fake_self.model[ACTIONS.index("WAIT"), 0] = 10.0
+
+    transitions = [
+        make_transition(step=index + 1, reward=1.0)
+        for index in range(5)
+    ]
+
+    td_error = update_q_learning(
+        self=fake_self,
+        transitions=transitions,
+    )
+
+    expected = sum(0.9**index for index in range(5)) + (0.9**5) * 10.0
+
+    assert np.isclose(td_error, expected)
+
+
+def test_terminal_truncated_return_skips_bootstrap():
+    fake_self = SimpleNamespace(
+        logger=Logger(),
+        model=np.zeros((len(ACTIONS), FEATURE_DIM)),
+        epsilon=0.2,
+        episodes_trained=1000,
+    )
+
+    fake_self.model[ACTIONS.index("WAIT"), 0] = 10.0
+
+    transitions = [
+        make_transition(step=1, reward=1.0),
+        make_transition(step=2, reward=2.0),
+        make_transition(step=3, reward=3.0, terminal=True),
+    ]
+
+    td_error = update_q_learning(
+        self=fake_self,
+        transitions=transitions,
+    )
+
+    expected = 1.0 + (0.9 * 2.0) + ((0.9**2) * 3.0)
+
+    assert np.isclose(td_error, expected)
+
+
+def test_short_episode_buffer_flushes_every_transition(monkeypatch):
+    processed_steps = []
+
+    def fake_update(self, transitions):
+        processed_steps.append(
+            transitions[0]["old_game_state"]["step"]
+        )
+        return 0.0
+
+    monkeypatch.setattr(train_module, "update_q_learning", fake_update)
+
+    fake_self = SimpleNamespace(
+        logger=Logger(),
+        model=np.zeros((len(ACTIONS), FEATURE_DIM)),
+        epsilon=0.2,
+        episodes_trained=1000,
+    )
+
+    setup_training(fake_self)
+
+    states = [make_state() for _ in range(4)]
+
+    for index in range(3):
+        states[index]["step"] = index + 1
+        states[index + 1]["step"] = index + 2
+        train_module.game_events_occurred(
+            fake_self,
+            states[index],
+            "WAIT",
+            states[index + 1],
+            [],
+        )
+
+    train_module.end_of_round(
+        fake_self,
+        states[3],
+        "WAIT",
+        [],
+    )
+
+    assert processed_steps == [1, 2, 3, 4]
+    assert len(fake_self.transition_buffer) == 0
+
+
+def test_each_transition_is_updated_once(monkeypatch):
+    processed_steps = []
+
+    def fake_update(self, transitions):
+        processed_steps.append(
+            transitions[0]["old_game_state"]["step"]
+        )
+        return 0.0
+
+    monkeypatch.setattr(train_module, "update_q_learning", fake_update)
+
+    fake_self = SimpleNamespace(
+        logger=Logger(),
+        model=np.zeros((len(ACTIONS), FEATURE_DIM)),
+        epsilon=0.2,
+        episodes_trained=1000,
+    )
+
+    setup_training(fake_self)
+
+    states = [make_state() for _ in range(8)]
+
+    for index in range(6):
+        states[index]["step"] = index + 1
+        states[index + 1]["step"] = index + 2
+        train_module.game_events_occurred(
+            fake_self,
+            states[index],
+            "WAIT",
+            states[index + 1],
+            [],
+        )
+
+    states[6]["step"] = 7
+    train_module.end_of_round(
+        fake_self,
+        states[6],
+        "WAIT",
+        [],
+    )
+
+    assert processed_steps == [1, 2, 3, 4, 5, 6, 7]
+    assert len(fake_self.transition_buffer) == 0

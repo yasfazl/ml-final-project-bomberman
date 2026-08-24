@@ -419,35 +419,36 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
                 best_crate_count,
             ) = best_crate_bombing_path(game_state)
 
-            current_crate_count, _opponent_count = bomb_target_counts(
+            current_crate_count, opponent_count = bomb_target_counts(
                 game_state
             )
 
-            features[38] = min(
-                best_crate_count / 4.0,
-                1.0,
-            )
+            if opponent_count == 0:
+                features[38] = min(
+                    best_crate_count / 4.0,
+                    1.0,
+                )
 
-            better_position_exists = (
-                best_distance is not None
-                and best_crate_count > current_crate_count
-            )
+                better_position_exists = (
+                    best_distance is not None
+                    and best_crate_count > current_crate_count
+                )
 
-            if better_position_exists:
-                features[32] = 1.0
+                if better_position_exists:
+                    features[32] = 1.0
 
-                if best_direction is not None:
-                    features[33 + best_direction] = 1.0
+                    if best_direction is not None:
+                        features[33 + best_direction] = 1.0
 
-                if best_distance not in (None, 0):
-                    field = game_state["field"]
-                    maximum_distance = (
-                        field.shape[0] + field.shape[1]
-                    )
-                    features[37] = min(
-                        best_distance / maximum_distance,
-                        1.0,
-                    )
+                    if best_distance not in (None, 0):
+                        field = game_state["field"]
+                        maximum_distance = (
+                            field.shape[0] + field.shape[1]
+                        )
+                        features[37] = min(
+                            best_distance / maximum_distance,
+                            1.0,
+                        )
 
     return features
 
