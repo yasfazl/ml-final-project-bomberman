@@ -1,3 +1,4 @@
+# Local one-step crate-efficiency fine-tuning (version 2).
 from typing import List
 import pickle
 
@@ -12,6 +13,7 @@ from .callbacks import (
     valid_action_indices,
 )
 from .game_utils import (
+    best_crate_bombing_path,
     bomb_target_counts,
     earliest_danger_times,
     nearest_crate_bombing_path,
@@ -30,6 +32,11 @@ EPSILON_START = 1.0
 EPSILON_MIN = 0.05
 EPSILON_DECAY = 0.995
 PURE_EXPLORATION_EPISODES = 100
+FINE_TUNE_EPSILON_START = 0.15
+
+# Features 0-31 belong to the already trained, stable Task 2 agent.
+# Fine-tuning updates only the seven additive crate-efficiency features.
+BASE_FEATURE_DIM = 32
 
 
 # ---------------------------------------------------------------------------
@@ -44,10 +51,19 @@ REWARD_MOVED_AWAY_FROM_COIN = -1.0
 REWARD_CRATE_DESTROYED = 2.0
 REWARD_MOVED_TOWARD_CRATE = 0.75
 REWARD_MOVED_AWAY_FROM_CRATE = -0.75
-REWARD_BOMB_TARGETED_CRATE = 0.75
+
+# A successfully placed bomb receives this reward once per targeted crate.
+# The slightly stronger immediate signal makes multi-crate positions valuable
+# without waiting several steps for the explosion event.
+REWARD_BOMB_TARGETED_CRATE = 1.25
 REWARD_BOMB_TARGETED_OPPONENT = 4.0
 REWARD_USELESS_BOMB = -5.0
 REWARD_BOMB_WHILE_COIN_VISIBLE = -4.0
+
+# New crate-efficiency shaping.
+REWARD_MOVED_TOWARD_BETTER_BOMB_SPOT = 0.5
+REWARD_MOVED_AWAY_FROM_BETTER_BOMB_SPOT = -0.5
+REWARD_BOMBED_BEFORE_BETTER_BOMB_SPOT = -1.0
 
 REWARD_MOVED_TOWARD_SAFETY = 1.5
 REWARD_REACHED_SAFETY = 4.0
@@ -66,12 +82,25 @@ REWARD_INVALID_ACTION = -2.0
 STEP_PENALTY = -0.05
 
 
+# ---------------------------------------------------------------------------
 # Custom events
+# ---------------------------------------------------------------------------
+
 MOVED_TOWARD_COIN = "MOVED_TOWARD_COIN"
 MOVED_AWAY_FROM_COIN = "MOVED_AWAY_FROM_COIN"
 
 MOVED_TOWARD_CRATE = "MOVED_TOWARD_CRATE"
 MOVED_AWAY_FROM_CRATE = "MOVED_AWAY_FROM_CRATE"
+
+MOVED_TOWARD_BETTER_BOMB_SPOT = (
+    "MOVED_TOWARD_BETTER_BOMB_SPOT"
+)
+MOVED_AWAY_FROM_BETTER_BOMB_SPOT = (
+    "MOVED_AWAY_FROM_BETTER_BOMB_SPOT"
+)
+BOMBED_BEFORE_BETTER_BOMB_SPOT = (
+    "BOMBED_BEFORE_BETTER_BOMB_SPOT"
+)
 
 BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
@@ -87,18 +116,31 @@ MOVED_INTO_TRAP = "MOVED_INTO_TRAP"
 
 
 def setup_training(self):
-    """Initialize training-only statistics."""
+    """Initialize training-only statistics for safe fine-tuning."""
     self.round_reward = 0.0
     self.round_td_errors = []
     self.training_steps = 0
 
+    # Protect the already-good coin, bomb, and escape behaviour. The model
+    # still uses every feature for Q-value calculation, but gradient updates
+    # are restricted to the new crate-efficiency columns.
+    self.freeze_base_features = True
+
     if self.episodes_trained == 0:
         self.epsilon = EPSILON_START
+    else:
+        # A mature stable model is usually already at epsilon=0.05. Give the
+        # seven new weights enough exploration to observe better bomb spots.
+        self.epsilon = max(
+            self.epsilon,
+            FINE_TUNE_EPSILON_START,
+        )
 
     self.logger.info(
-        f"TD Q-learning initialized: "
+        f"TD Q-learning crate-efficiency fine-tuning initialized: "
         f"episodes={self.episodes_trained}, "
-        f"epsilon={self.epsilon:.3f}"
+        f"epsilon={self.epsilon:.3f}, "
+        f"frozen_features=0:{BASE_FEATURE_DIM}"
     )
 
 
@@ -112,6 +154,11 @@ def game_events_occurred(
     """Add shaped events and perform one TD Q-learning update."""
     add_coin_distance_event(old_game_state, new_game_state, events)
     add_crate_navigation_event(old_game_state, new_game_state, events)
+    add_crate_efficiency_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
     add_bomb_placement_event(old_game_state, self_action, events)
     add_waiting_event(old_game_state, self_action, events)
     add_escape_events(
@@ -202,7 +249,15 @@ def update_q_learning(
     new_game_state: dict | None,
     reward: float,
 ) -> float | None:
-    """Apply one semi-gradient linear Q-learning update."""
+    """Apply one semi-gradient linear Q-learning update.
+
+    During crate-efficiency fine-tuning, Q-values still use the complete
+    model, while only columns 32 onward receive gradient updates. This keeps
+    the trained Task 2 behaviour bit-for-bit unchanged in columns 0-31.
+
+    Tests and optional fresh training can omit ``freeze_base_features`` to
+    retain the original full-model update behaviour.
+    """
     if old_game_state is None:
         return None
 
@@ -232,7 +287,26 @@ def update_q_learning(
 
     td_error = target - current_q_value
 
-    self.model[action_index] += ALPHA * td_error * features
+    if getattr(self, "freeze_base_features", False):
+        if self.model.shape[1] <= BASE_FEATURE_DIM:
+            raise ValueError(
+                "Crate-efficiency fine-tuning requires features "
+                f"after index {BASE_FEATURE_DIM - 1}, but model shape is "
+                f"{self.model.shape}."
+            )
+
+        self.model[
+            action_index,
+            BASE_FEATURE_DIM:,
+        ] += (
+            ALPHA
+            * td_error
+            * features[BASE_FEATURE_DIM:]
+        )
+    else:
+        self.model[action_index] += (
+            ALPHA * td_error * features
+        )
 
     return float(td_error)
 
@@ -272,7 +346,7 @@ def add_bomb_placement_event(
     action: str,
     events: List[str],
 ):
-    """Describe the targets of a successfully placed bomb."""
+    """Describe the targets and efficiency of a placed bomb."""
     if old_game_state is None or action != "BOMB":
         return
 
@@ -281,8 +355,25 @@ def add_bomb_placement_event(
 
     crate_count, opponent_count = bomb_target_counts(old_game_state)
 
-    # Add one event per targeted crate, so a bomb that can destroy two
-    # crates receives twice the immediate placement credit.
+    # Penalize taking a one-crate bomb when a strictly better safe position
+    # is reachable nearby. Do not penalize a bomb that already targets an
+    # opponent, since that has a separate high-value purpose.
+    (
+        _best_direction,
+        best_distance,
+        best_crate_count,
+    ) = best_crate_bombing_path(old_game_state)
+
+    better_crate_position_exists = (
+        best_distance not in (None, 0)
+        and best_crate_count > crate_count
+    )
+
+    if better_crate_position_exists and opponent_count == 0:
+        events.append(BOMBED_BEFORE_BETTER_BOMB_SPOT)
+
+    # Add one event per targeted crate, so a two-crate bomb receives twice
+    # the immediate placement credit of a one-crate bomb.
     for _ in range(crate_count):
         events.append(BOMB_TARGETED_CRATE)
 
@@ -301,20 +392,16 @@ def add_crate_navigation_event(
     new_game_state: dict,
     events: List[str],
 ):
-    """Reward progress toward a reachable safe crate-bombing tile."""
+    """Reward progress toward any reachable safe crate-bombing tile."""
     if old_game_state is None or new_game_state is None:
         return
 
-    # A visible coin is a more immediate target.
     if old_game_state.get("coins", []):
         return
 
-    # Escape rewards take control while bombs are active.
     if old_game_state.get("bombs", []) or new_game_state.get("bombs", []):
         return
 
-    # A destroyed crate changes the target set, so distances are not
-    # comparable across that transition.
     if not np.array_equal(
         old_game_state["field"],
         new_game_state["field"],
@@ -331,6 +418,76 @@ def add_crate_navigation_event(
         events.append(MOVED_TOWARD_CRATE)
     elif new_distance > old_distance:
         events.append(MOVED_AWAY_FROM_CRATE)
+
+
+def add_crate_efficiency_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+):
+    """Reward movement toward a higher-yield safe bomb position.
+
+    The event is active only when the old position has a strictly better
+    candidate nearby. Crate layouts and active bombs must remain unchanged,
+    so this shaping never interferes with coin collection or bomb escape.
+    """
+    if old_game_state is None or new_game_state is None:
+        return
+
+    if (
+        old_game_state.get("coins", [])
+        or new_game_state.get("coins", [])
+    ):
+        return
+
+    if (
+        old_game_state.get("bombs", [])
+        or new_game_state.get("bombs", [])
+    ):
+        return
+
+    if not np.array_equal(
+        old_game_state["field"],
+        new_game_state["field"],
+    ):
+        return
+
+    (
+        _old_direction,
+        old_distance,
+        old_best_crate_count,
+    ) = best_crate_bombing_path(old_game_state)
+
+    old_current_crate_count, _old_opponent_count = bomb_target_counts(
+        old_game_state
+    )
+
+    old_has_better_position = (
+        old_distance not in (None, 0)
+        and old_best_crate_count > old_current_crate_count
+    )
+
+    if not old_has_better_position:
+        return
+
+    (
+        _new_direction,
+        new_distance,
+        new_best_crate_count,
+    ) = best_crate_bombing_path(new_game_state)
+
+    if new_distance is None:
+        events.append(MOVED_AWAY_FROM_BETTER_BOMB_SPOT)
+        return
+
+    if new_best_crate_count > old_best_crate_count:
+        events.append(MOVED_TOWARD_BETTER_BOMB_SPOT)
+    elif new_best_crate_count < old_best_crate_count:
+        events.append(MOVED_AWAY_FROM_BETTER_BOMB_SPOT)
+    elif new_distance < old_distance:
+        events.append(MOVED_TOWARD_BETTER_BOMB_SPOT)
+    elif new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_BETTER_BOMB_SPOT)
 
 
 def _current_position_is_dangerous(game_state: dict) -> bool:
@@ -351,8 +508,6 @@ def add_waiting_event(
     if old_game_state is None or action != "WAIT":
         return
 
-    # Waiting can be necessary after escaping while a bomb finishes its
-    # countdown, so do not add the goal penalty during active bombs.
     if old_game_state.get("bombs", []):
         return
 
@@ -420,6 +575,12 @@ def reward_from_events(self, events: List[str]) -> float:
         MOVED_AWAY_FROM_COIN: REWARD_MOVED_AWAY_FROM_COIN,
         MOVED_TOWARD_CRATE: REWARD_MOVED_TOWARD_CRATE,
         MOVED_AWAY_FROM_CRATE: REWARD_MOVED_AWAY_FROM_CRATE,
+        MOVED_TOWARD_BETTER_BOMB_SPOT:
+            REWARD_MOVED_TOWARD_BETTER_BOMB_SPOT,
+        MOVED_AWAY_FROM_BETTER_BOMB_SPOT:
+            REWARD_MOVED_AWAY_FROM_BETTER_BOMB_SPOT,
+        BOMBED_BEFORE_BETTER_BOMB_SPOT:
+            REWARD_BOMBED_BEFORE_BETTER_BOMB_SPOT,
         BOMB_TARGETED_CRATE: REWARD_BOMB_TARGETED_CRATE,
         BOMB_TARGETED_OPPONENT: REWARD_BOMB_TARGETED_OPPONENT,
         USELESS_BOMB: REWARD_USELESS_BOMB,
@@ -449,6 +610,8 @@ def save_model(self):
         "weights": self.model,
         "epsilon": self.epsilon,
         "episodes_trained": self.episodes_trained,
+        "feature_dim": int(self.model.shape[1]),
+        "training_stage": "local_crate_efficiency_fine_tuning_v2",
     }
 
     temporary_path = MODEL_PATH.with_suffix(".tmp")

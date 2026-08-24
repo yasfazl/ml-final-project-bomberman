@@ -8,6 +8,7 @@ import numpy as np
 import settings as s
 
 from .game_utils import (
+    best_crate_bombing_path,
     bomb_target_counts,
     earliest_danger_times,
     has_escape_route_after_bomb,
@@ -44,7 +45,11 @@ DIRECTIONS = {
 # 26: whether a reachable safe crate-bombing tile exists
 # 27-30: first direction toward that crate-bombing tile
 # 31: normalized distance to that crate-bombing tile
-FEATURE_DIM = 32
+# 32: whether a better nearby safe crate-bombing position exists
+# 33-36: first direction toward that better position
+# 37: normalized distance to that better position
+# 38: normalized crate yield at the best nearby position
+FEATURE_DIM = 39
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -53,8 +58,8 @@ def setup(self):
     """
     Initialize or load the Q-learning model.
 
-    Smaller compatible models are migrated to 26 features by preserving
-    their old weights and initializing new weights to zero.
+    Smaller compatible models are migrated to FEATURE_DIM features by
+    preserving their old weights and initializing new weights to zero.
     """
     self.model_path = MODEL_PATH
 
@@ -215,6 +220,13 @@ def _trace_decision(
     crate_direction, crate_distance = nearest_crate_bombing_path(
         game_state
     )
+    (
+        best_crate_direction,
+        best_crate_distance,
+        best_crate_count,
+    ) = best_crate_bombing_path(
+        game_state,
+    )
     crate_targets, opponent_targets = bomb_target_counts(game_state)
 
     print(
@@ -224,6 +236,7 @@ def _trace_decision(
         f"bombs={game_state.get('bombs', [])} "
         f"coin={(coin_direction, coin_distance)} "
         f"crate={(crate_direction, crate_distance)} "
+        f"best_crate={(best_crate_direction, best_crate_distance, best_crate_count)} "
         f"escape={(escape_direction, escape_distance)} "
         f"targets={(crate_targets, opponent_targets)} "
         f"valid={valid_actions} "
@@ -374,9 +387,8 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
             1.0,
         )
 
-    # Visible coins have priority. Activating both the coin direction and
-    # crate direction at once can create conflicting Q-value signals and
-    # two-tile loops.
+    # Visible coins keep priority. Features 0-31 retain exactly the same
+    # meaning as in the stable Task 2 model.
     if not coins:
         crate_direction, crate_distance = nearest_crate_bombing_path(
             game_state
@@ -395,6 +407,47 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
                 crate_distance / maximum_distance,
                 1.0,
             )
+
+        # New additive features compare the current bomb yield with the
+        # best safe bombing position no more than four movements away.
+        # They are disabled while bombs are active so escape remains the
+        # unambiguous immediate goal.
+        if not game_state.get("bombs", []):
+            (
+                best_direction,
+                best_distance,
+                best_crate_count,
+            ) = best_crate_bombing_path(game_state)
+
+            current_crate_count, _opponent_count = bomb_target_counts(
+                game_state
+            )
+
+            features[38] = min(
+                best_crate_count / 4.0,
+                1.0,
+            )
+
+            better_position_exists = (
+                best_distance is not None
+                and best_crate_count > current_crate_count
+            )
+
+            if better_position_exists:
+                features[32] = 1.0
+
+                if best_direction is not None:
+                    features[33 + best_direction] = 1.0
+
+                if best_distance not in (None, 0):
+                    field = game_state["field"]
+                    maximum_distance = (
+                        field.shape[0] + field.shape[1]
+                    )
+                    features[37] = min(
+                        best_distance / maximum_distance,
+                        1.0,
+                    )
 
     return features
 

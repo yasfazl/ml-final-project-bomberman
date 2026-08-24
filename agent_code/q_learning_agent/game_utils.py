@@ -388,3 +388,126 @@ def nearest_crate_bombing_path(
             )
 
     return None, None
+
+
+def best_crate_bombing_path(
+    game_state: dict,
+    max_search_distance: int = 1,
+) -> tuple[int | None, int | None, int]:
+    """
+    Find a nearby safe bomb position with the highest crate yield.
+
+    Candidate positions are reachable empty tiles no more than
+    ``max_search_distance`` movements away. A candidate is accepted only
+    when placing a bomb there would hit at least one crate and still leave
+    a time-aware escape route.
+
+    Candidates are ordered by:
+
+    1. larger number of crates hit;
+    2. shorter path distance;
+    3. BFS direction order for deterministic tie-breaking.
+
+    Returns:
+        first_direction:
+            0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
+        distance:
+            movements required to reach the selected position
+        crate_count:
+            crates affected by a bomb at that position
+
+    Special result ``(None, None, 0)`` means no suitable position exists.
+    ``first_direction`` is None with distance zero when the current tile is
+    already the best position.
+    """
+    field = game_state["field"]
+    start_position = tuple(game_state["self"][3])
+
+    if max_search_distance < 0:
+        raise ValueError("max_search_distance must be non-negative")
+
+    if not np.any(field == 1):
+        return None, None, 0
+
+    blocked_positions = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+    blocked_positions.update(
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    )
+
+    # Queue entries: (position, first_direction, distance)
+    queue = [(start_position, None, 0)]
+    queue_index = 0
+    visited = {start_position}
+
+    best_direction = None
+    best_distance = None
+    best_crate_count = 0
+
+    while queue_index < len(queue):
+        position, first_direction, distance = queue[queue_index]
+        queue_index += 1
+
+        crate_count, _opponent_count = bomb_target_counts(
+            game_state,
+            bomb_position=position,
+        )
+
+        if crate_count > 0:
+            simulated_state = dict(game_state)
+            agent_info = list(game_state["self"])
+            agent_info[2] = True
+            agent_info[3] = position
+            simulated_state["self"] = tuple(agent_info)
+
+            if has_escape_route_after_bomb(simulated_state):
+                candidate_key = (crate_count, -distance)
+                best_key = (
+                    best_crate_count,
+                    -best_distance if best_distance is not None else 0,
+                )
+
+                if (
+                    best_distance is None
+                    or candidate_key > best_key
+                ):
+                    best_direction = first_direction
+                    best_distance = distance
+                    best_crate_count = crate_count
+
+        if distance >= max_search_distance:
+            continue
+
+        x, y = position
+
+        for direction_index, (dx, dy) in enumerate(DIRECTIONS):
+            next_position = (x + dx, y + dy)
+
+            if next_position in visited:
+                continue
+            if next_position in blocked_positions:
+                continue
+            if field[next_position] != 0:
+                continue
+
+            visited.add(next_position)
+            next_first_direction = (
+                direction_index
+                if first_direction is None
+                else first_direction
+            )
+            queue.append(
+                (
+                    next_position,
+                    next_first_direction,
+                    distance + 1,
+                )
+            )
+
+    if best_distance is None:
+        return None, None, 0
+
+    return best_direction, best_distance, best_crate_count

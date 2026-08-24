@@ -48,7 +48,7 @@ def test_bomb_requires_a_target():
     state = make_state()
     features = state_to_features(state)
 
-    assert FEATURE_DIM == 32
+    assert FEATURE_DIM == 39
     assert features[17] == 1.0
     assert features[18] == 1.0
     assert features[19] == 0.0
