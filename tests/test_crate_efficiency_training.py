@@ -12,9 +12,13 @@ from agent_code.q_learning_agent.train import (
     BASE_FEATURE_DIM,
     BOMBED_BEFORE_BETTER_BOMB_SPOT,
     MOVED_AWAY_FROM_BETTER_BOMB_SPOT,
+    MOVED_AWAY_FROM_OPPONENT,
     MOVED_TOWARD_BETTER_BOMB_SPOT,
+    MOVED_TOWARD_OPPONENT,
     add_bomb_placement_event,
     add_crate_efficiency_navigation_event,
+    add_endgame_opponent_navigation_event,
+    reward_from_events,
     setup_training,
     update_q_learning,
 )
@@ -162,7 +166,7 @@ def test_bombing_early_is_penalized_when_better_spot_exists():
     assert BOMBED_BEFORE_BETTER_BOMB_SPOT in events
 
 
-def test_fine_tuning_preserves_original_feature_weights():
+def test_endgame_training_freezes_original_feature_weights():
     fake_self = SimpleNamespace(
         logger=Logger(),
         model=np.zeros((len(ACTIONS), FEATURE_DIM)),
@@ -173,15 +177,19 @@ def test_fine_tuning_preserves_original_feature_weights():
     setup_training(fake_self)
     weights_before = fake_self.model.copy()
 
+    field = open_field(size=11)
+    old_state = make_state(position=(5, 5), field=field)
+    old_state["others"] = [("opponent", 0, False, (9, 5))]
+    new_state = make_state(position=(6, 5), field=field)
+    new_state["others"] = [("opponent", 0, False, (9, 5))]
     transitions = [
-        make_transition(
-            step=index + 1,
-            reward=1.0,
-            action="LEFT",
-            terminal=(index == 4),
-            field=efficient_crate_field(),
-        )
-        for index in range(5)
+        {
+            "old_game_state": old_state,
+            "action": "DOWN",
+            "reward": 1.0,
+            "new_game_state": new_state,
+            "terminal": False,
+        }
     ]
 
     update_q_learning(
@@ -189,7 +197,7 @@ def test_fine_tuning_preserves_original_feature_weights():
         transitions=transitions,
     )
 
-    action_index = ACTIONS.index("LEFT")
+    action_index = ACTIONS.index("DOWN")
 
     assert np.array_equal(
         fake_self.model[:, :BASE_FEATURE_DIM],
@@ -201,6 +209,76 @@ def test_fine_tuning_preserves_original_feature_weights():
             BASE_FEATURE_DIM:,
         ] != 0.0
     )
+
+
+def test_endgame_opponent_navigation_reward_is_added_correctly():
+    field = open_field(size=11)
+    old_state = make_state(position=(5, 5), field=field)
+    old_state["others"] = [("opponent", 0, False, (10, 5))]
+    new_state = make_state(position=(6, 5), field=field)
+    new_state["others"] = [("opponent", 0, False, (10, 5))]
+    events = []
+
+    add_endgame_opponent_navigation_event(old_state, new_state, events)
+
+    assert MOVED_TOWARD_OPPONENT in events
+    assert MOVED_AWAY_FROM_OPPONENT not in events
+    assert reward_from_events(SimpleNamespace(logger=Logger()), events) == 0.45
+
+    away_events = []
+    add_endgame_opponent_navigation_event(
+        new_state,
+        old_state,
+        away_events,
+    )
+    assert MOVED_AWAY_FROM_OPPONENT in away_events
+
+
+def test_reaching_immediate_opponent_bomb_range_is_toward():
+    field = open_field(size=11)
+    old_state = make_state(position=(5, 5), field=field)
+    old_state["others"] = [("opponent", 0, False, (10, 5))]
+
+    # From (7, 5), bomb power can immediately reach opponent at (10, 5).
+    new_state = make_state(position=(7, 5), field=field)
+    new_state["others"] = [("opponent", 0, False, (10, 5))]
+
+    events = []
+    add_endgame_opponent_navigation_event(old_state, new_state, events)
+
+    assert MOVED_TOWARD_OPPONENT in events
+    assert MOVED_AWAY_FROM_OPPONENT not in events
+
+
+def test_inactive_new_endgame_state_does_not_add_away_event():
+    field = open_field(size=11)
+    old_state = make_state(position=(5, 5), field=field)
+    old_state["others"] = [("opponent", 0, False, (10, 5))]
+
+    bomb_new_state = make_state(position=(6, 5), field=field)
+    bomb_new_state["others"] = [("opponent", 0, False, (10, 5))]
+    bomb_new_state["bombs"] = [((8, 5), 3)]
+
+    bomb_events = []
+    add_endgame_opponent_navigation_event(
+        old_state,
+        bomb_new_state,
+        bomb_events,
+    )
+
+    assert MOVED_AWAY_FROM_OPPONENT not in bomb_events
+
+    disappeared_new_state = make_state(position=(6, 5), field=field)
+    disappeared_new_state["others"] = []
+
+    disappeared_events = []
+    add_endgame_opponent_navigation_event(
+        old_state,
+        disappeared_new_state,
+        disappeared_events,
+    )
+
+    assert MOVED_AWAY_FROM_OPPONENT not in disappeared_events
 
 
 def test_exact_five_step_return_uses_bootstrap():

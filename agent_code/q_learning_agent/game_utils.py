@@ -318,6 +318,74 @@ def bomb_target_counts(
     return int(crate_count), int(opponent_count)
 
 
+def nearest_opponent_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """Find the shortest walkable path to a tile adjacent to an opponent."""
+    field = game_state["field"]
+    start_position = tuple(game_state["self"][3])
+
+    opponent_positions = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+
+    if not opponent_positions:
+        return None, None
+
+    blocked_positions = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+    blocked_positions.update(opponent_positions)
+
+    # Queue entries: (position, first_direction, distance)
+    queue = [(start_position, None, 0)]
+    queue_index = 0
+    visited = {start_position}
+
+    while queue_index < len(queue):
+        position, first_direction, distance = queue[queue_index]
+        queue_index += 1
+
+        if any(
+            abs(position[0] - opponent_x) + abs(position[1] - opponent_y)
+            == 1
+            for opponent_x, opponent_y in opponent_positions
+        ):
+            if distance > 0:
+                return first_direction, distance
+
+        x, y = position
+
+        for direction_index, (dx, dy) in enumerate(DIRECTIONS):
+            next_position = (x + dx, y + dy)
+
+            if next_position in visited:
+                continue
+            if next_position in blocked_positions:
+                continue
+            if field[next_position] != 0:
+                continue
+
+            visited.add(next_position)
+            next_first_direction = (
+                direction_index
+                if first_direction is None
+                else first_direction
+            )
+
+            queue.append(
+                (
+                    next_position,
+                    next_first_direction,
+                    distance + 1,
+                )
+            )
+
+    return None, None
+
+
 def nearest_crate_bombing_path(
     game_state: dict,
 ) -> tuple[int | None, int | None]:

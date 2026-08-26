@@ -1,4 +1,4 @@
-# Local crate-efficiency fine-tuning with five-step n-step updates.
+# Endgame-opponent fine-tuning with five-step n-step updates.
 from collections import deque
 from typing import List
 import pickle
@@ -9,6 +9,7 @@ import events as e
 from .callbacks import (
     ACTIONS,
     MODEL_PATH,
+    endgame_opponent_pursuit_active,
     nearest_coin_path,
     state_to_features,
     valid_action_indices,
@@ -18,6 +19,7 @@ from .game_utils import (
     bomb_target_counts,
     earliest_danger_times,
     nearest_crate_bombing_path,
+    nearest_opponent_path,
     nearest_safe_path,
 )
 
@@ -36,9 +38,9 @@ EPSILON_DECAY = 0.995
 PURE_EXPLORATION_EPISODES = 100
 FINE_TUNE_EPSILON_START = 0.15
 
-# Features 0-31 belong to the already trained, stable Task 2 agent.
-# Fine-tuning updates only the seven additive crate-efficiency features.
-BASE_FEATURE_DIM = 32
+# Features 0-38 belong to the already trained, stable Task 2 agent.
+# Fine-tuning updates only the endgame-opponent features.
+BASE_FEATURE_DIM = 39
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,8 @@ REWARD_BOMB_WHILE_COIN_VISIBLE = -4.0
 REWARD_MOVED_TOWARD_BETTER_BOMB_SPOT = 0.5
 REWARD_MOVED_AWAY_FROM_BETTER_BOMB_SPOT = -0.5
 REWARD_BOMBED_BEFORE_BETTER_BOMB_SPOT = -1.0
+REWARD_MOVED_TOWARD_OPPONENT = 0.5
+REWARD_MOVED_AWAY_FROM_OPPONENT = -0.5
 
 REWARD_MOVED_TOWARD_SAFETY = 1.5
 REWARD_REACHED_SAFETY = 4.0
@@ -103,6 +107,8 @@ MOVED_AWAY_FROM_BETTER_BOMB_SPOT = (
 BOMBED_BEFORE_BETTER_BOMB_SPOT = (
     "BOMBED_BEFORE_BETTER_BOMB_SPOT"
 )
+MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
+MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
 
 BOMB_TARGETED_CRATE = "BOMB_TARGETED_CRATE"
 BOMB_TARGETED_OPPONENT = "BOMB_TARGETED_OPPONENT"
@@ -140,7 +146,7 @@ def setup_training(self):
         )
 
     self.logger.info(
-        f"TD Q-learning crate-efficiency fine-tuning initialized: "
+        f"TD Q-learning endgame-opponent fine-tuning initialized: "
         f"episodes={self.episodes_trained}, "
         f"epsilon={self.epsilon:.3f}, "
         f"frozen_features=0:{BASE_FEATURE_DIM}"
@@ -158,6 +164,11 @@ def game_events_occurred(
     add_coin_distance_event(old_game_state, new_game_state, events)
     add_crate_navigation_event(old_game_state, new_game_state, events)
     add_crate_efficiency_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
+    add_endgame_opponent_navigation_event(
         old_game_state,
         new_game_state,
         events,
@@ -280,9 +291,9 @@ def update_q_learning(
 ) -> float | None:
     """Apply one semi-gradient linear n-step Q-learning update.
 
-    During crate-efficiency fine-tuning, Q-values still use the complete
-    model, while only columns 32 onward receive gradient updates. This keeps
-    the trained Task 2 behaviour bit-for-bit unchanged in columns 0-31.
+    During endgame-opponent fine-tuning, Q-values still use the complete
+    model, while only columns 39 onward receive gradient updates. This keeps
+    the trained Task 2 behaviour bit-for-bit unchanged in columns 0-38.
 
     ``transitions`` must contain the oldest transition first.
     The legacy one-step keyword arguments are still accepted for tests and
@@ -334,7 +345,7 @@ def update_q_learning(
     if getattr(self, "freeze_base_features", False):
         if self.model.shape[1] <= BASE_FEATURE_DIM:
             raise ValueError(
-                "Crate-efficiency fine-tuning requires features "
+                "Endgame-opponent fine-tuning requires features "
                 f"after index {BASE_FEATURE_DIM - 1}, but model shape is "
                 f"{self.model.shape}."
             )
@@ -590,6 +601,43 @@ def _current_position_is_dangerous(game_state: dict) -> bool:
     return not np.isinf(danger_times[position])
 
 
+def add_endgame_opponent_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+):
+    """Reward movement toward an opponent during the final endgame."""
+    if old_game_state is None or new_game_state is None:
+        return
+
+    if not endgame_opponent_pursuit_active(old_game_state):
+        return
+
+    _old_direction, old_distance = nearest_opponent_path(old_game_state)
+    if old_distance is None:
+        return
+
+    _new_crate_count, new_opponent_count = bomb_target_counts(
+        new_game_state
+    )
+    if new_opponent_count > 0:
+        events.append(MOVED_TOWARD_OPPONENT)
+        return
+
+    if not endgame_opponent_pursuit_active(new_game_state):
+        return
+
+    _new_direction, new_distance = nearest_opponent_path(new_game_state)
+
+    if new_distance is None:
+        return
+
+    if new_distance < old_distance:
+        events.append(MOVED_TOWARD_OPPONENT)
+    elif new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_OPPONENT)
+
+
 def add_waiting_event(
     old_game_state: dict,
     action: str,
@@ -604,11 +652,12 @@ def add_waiting_event(
 
     coin_distance = nearest_coin_path(old_game_state)[1]
     crate_distance = nearest_crate_bombing_path(old_game_state)[1]
+    has_endgame_goal = endgame_opponent_pursuit_active(old_game_state)
 
     has_coin_goal = coin_distance is not None
     has_crate_goal = crate_distance is not None
 
-    if has_coin_goal or has_crate_goal:
+    if has_coin_goal or has_crate_goal or has_endgame_goal:
         events.append(WAITED_WITH_GOAL)
 
 
@@ -672,6 +721,8 @@ def reward_from_events(self, events: List[str]) -> float:
             REWARD_MOVED_AWAY_FROM_BETTER_BOMB_SPOT,
         BOMBED_BEFORE_BETTER_BOMB_SPOT:
             REWARD_BOMBED_BEFORE_BETTER_BOMB_SPOT,
+        MOVED_TOWARD_OPPONENT: REWARD_MOVED_TOWARD_OPPONENT,
+        MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
         BOMB_TARGETED_CRATE: REWARD_BOMB_TARGETED_CRATE,
         BOMB_TARGETED_OPPONENT: REWARD_BOMB_TARGETED_OPPONENT,
         USELESS_BOMB: REWARD_USELESS_BOMB,
@@ -702,7 +753,7 @@ def save_model(self):
         "epsilon": self.epsilon,
         "episodes_trained": self.episodes_trained,
         "feature_dim": int(self.model.shape[1]),
-        "training_stage": "five_step_crate_efficiency_v3",
+        "training_stage": "five_step_endgame_opponent_pursuit_v4",
     }
 
     temporary_path = MODEL_PATH.with_suffix(".tmp")

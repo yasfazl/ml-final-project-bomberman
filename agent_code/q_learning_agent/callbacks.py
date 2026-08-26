@@ -13,6 +13,7 @@ from .game_utils import (
     earliest_danger_times,
     has_escape_route_after_bomb,
     nearest_crate_bombing_path,
+    nearest_opponent_path,
     nearest_safe_path,
 )
 
@@ -49,7 +50,10 @@ DIRECTIONS = {
 # 33-36: first direction toward that better position
 # 37: normalized distance to that better position
 # 38: normalized crate yield at the best nearby position
-FEATURE_DIM = 39
+# 39: whether endgame opponent pursuit is active
+# 40-43: first direction toward nearest opponent-adjacent tile
+# 44: normalized distance to nearest opponent-adjacent tile
+FEATURE_DIM = 45
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -300,6 +304,43 @@ def danger_urgency(danger_time: float) -> float:
     return 1.0 / (float(danger_time) + 1.0)
 
 
+def endgame_opponent_pursuit_active(game_state: dict) -> bool:
+    """Return whether endgame opponent-pursuit features should be enabled."""
+    if game_state is None:
+        return False
+
+    if game_state.get("coins", []):
+        return False
+
+    field = game_state["field"]
+
+    if np.any(field == 1):
+        return False
+
+    if not game_state.get("others", []):
+        return False
+
+    if game_state.get("bombs", []):
+        return False
+
+    explosion_map = game_state.get("explosion_map")
+    if explosion_map is not None and np.any(np.asarray(explosion_map) > 0):
+        return False
+
+    _crate_count, opponent_count = bomb_target_counts(game_state)
+    if opponent_count != 0:
+        return False
+
+    opponent_direction, opponent_distance = nearest_opponent_path(
+        game_state
+    )
+
+    return (
+        opponent_direction is not None
+        and opponent_distance not in (None, 0)
+    )
+
+
 def state_to_features(game_state: dict) -> np.ndarray | None:
     """Convert the game state into a low-dimensional feature vector."""
     if game_state is None:
@@ -449,6 +490,24 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
                             best_distance / maximum_distance,
                             1.0,
                         )
+
+    if endgame_opponent_pursuit_active(game_state):
+        opponent_direction, opponent_distance = nearest_opponent_path(
+            game_state
+        )
+
+        features[39] = 1.0
+
+        if opponent_direction is not None:
+            features[40 + opponent_direction] = 1.0
+
+        if opponent_distance not in (None, 0):
+            field = game_state["field"]
+            maximum_distance = field.shape[0] + field.shape[1]
+            features[44] = min(
+                opponent_distance / maximum_distance,
+                1.0,
+            )
 
     return features
 

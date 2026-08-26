@@ -48,7 +48,8 @@ def test_bomb_requires_a_target():
     state = make_state()
     features = state_to_features(state)
 
-    assert FEATURE_DIM == 39
+    assert FEATURE_DIM == 45
+    assert features.shape == (FEATURE_DIM,)
     assert features[17] == 1.0
     assert features[18] == 1.0
     assert features[19] == 0.0
@@ -88,9 +89,12 @@ def test_escape_direction_features():
     assert features[25] == 0.5
 
 
-def test_setup_migrates_an_11_feature_model(tmp_path, monkeypatch):
+def test_setup_migrates_a_39_feature_model(tmp_path, monkeypatch):
     model_path = tmp_path / "q_model.pkl"
-    old_weights = np.ones((len(ACTIONS), 11), dtype=np.float64)
+    old_weights = np.arange(
+        len(ACTIONS) * 39,
+        dtype=np.float64,
+    ).reshape(len(ACTIONS), 39)
 
     with model_path.open("wb") as file:
         pickle.dump(
@@ -115,7 +119,7 @@ def test_setup_migrates_an_11_feature_model(tmp_path, monkeypatch):
     callbacks.setup(fake_self)
 
     assert fake_self.model.shape == (len(ACTIONS), FEATURE_DIM)
-    assert np.allclose(fake_self.model[:, :11], old_weights)
-    assert np.allclose(fake_self.model[:, 11:], 0.0)
+    assert np.allclose(fake_self.model[:, :39], old_weights)
+    assert np.allclose(fake_self.model[:, 39:], 0.0)
     assert fake_self.epsilon == 0.2
     assert fake_self.episodes_trained == 100

@@ -3,6 +3,7 @@ import numpy as np
 from agent_code.q_learning_agent.game_utils import (
     blast_tiles,
     earliest_danger_times,
+    nearest_opponent_path,
 )
 
 
@@ -114,3 +115,22 @@ def test_active_explosion_has_zero_danger_time():
     danger = earliest_danger_times(state)
 
     assert danger[3, 3] == 0.0
+
+
+def test_nearest_opponent_path_points_to_adjacent_tile():
+    field = open_field(size=11)
+    state = {
+        "field": field,
+        "self": ("q_learning_agent", 0, True, (5, 5)),
+        "others": [("opponent", 0, True, (9, 5))],
+        "bombs": [],
+        "coins": [],
+        "explosion_map": np.zeros_like(field),
+        "round": 1,
+        "step": 1,
+    }
+
+    direction, distance = nearest_opponent_path(state)
+
+    assert direction == 1  # RIGHT
+    assert distance == 3

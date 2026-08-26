@@ -37,7 +37,7 @@ def make_state(field=None, bombs=None):
 def test_safe_board_features():
     features = state_to_features(make_state())
 
-    assert FEATURE_DIM == 39
+    assert FEATURE_DIM == 45
     assert features.shape == (FEATURE_DIM,)
     assert np.allclose(features[11:17], 0.0)
 

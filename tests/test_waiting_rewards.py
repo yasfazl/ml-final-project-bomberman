@@ -58,3 +58,18 @@ def test_waiting_during_active_bomb_has_no_extra_goal_penalty():
     add_waiting_event(state, "WAIT", events)
 
     assert WAITED_WITH_GOAL not in events
+
+
+def test_waiting_during_endgame_pursuit_uses_goal_penalty():
+    field = open_field(size=11)
+    state = make_state(field)
+    state["self"] = ("test", 0, True, (5, 5))
+    state["others"] = [("opponent", 0, False, (9, 5))]
+    state["coins"] = []
+    state["explosion_map"] = np.zeros_like(field)
+    events = []
+
+    add_waiting_event(state, "WAIT", events)
+
+    assert WAITED_WITH_GOAL in events
+    assert reward_from_events(SimpleNamespace(logger=Logger()), events) < -1.0
