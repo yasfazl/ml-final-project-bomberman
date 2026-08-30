@@ -9,11 +9,13 @@ import settings as s
 
 from .game_utils import (
     best_crate_bombing_path,
+    blast_tiles,
     bomb_target_counts,
     earliest_danger_times,
     has_escape_route_after_bomb,
     nearest_crate_bombing_path,
     nearest_safe_path,
+    tile_is_safe_at_time,
 )
 
 
@@ -69,6 +71,8 @@ def setup(self):
     )
     self.epsilon = 1.0
     self.episodes_trained = 0
+    self.last_own_bomb_position = None
+    self.last_seen_round = None
 
     if not self.model_path.is_file():
         self.logger.info("No saved model found. Starting from scratch.")
@@ -144,12 +148,26 @@ def act(self, game_state: dict) -> str:
     if game_state is None:
         return "WAIT"
 
+    current_round = game_state.get("round")
+
+    if getattr(self, "last_seen_round", None) != current_round:
+        self.last_seen_round = current_round
+        self.last_own_bomb_position = None
+
+    _clear_inactive_own_bomb_memory(self, game_state)
+
     features = state_to_features(game_state)
     valid_indices = valid_action_indices(game_state)
+    candidate_indices = _post_bomb_candidate_indices(
+        self,
+        game_state,
+        valid_indices,
+    )
 
     if self.train and random.random() < self.epsilon:
-        action_index = random.choice(valid_indices)
+        action_index = random.choice(candidate_indices)
         chosen_action = ACTIONS[action_index]
+        _remember_own_bomb_if_selected(self, chosen_action, game_state)
         self.logger.debug(
             f"Exploration: selected {chosen_action} "
             f"with epsilon={self.epsilon:.3f}"
@@ -157,7 +175,7 @@ def act(self, game_state: dict) -> str:
         _trace_decision(
             game_state,
             features,
-            valid_indices,
+            candidate_indices,
             None,
             chosen_action,
             "explore",
@@ -167,7 +185,7 @@ def act(self, game_state: dict) -> str:
     q_values = self.model @ features
 
     masked_q_values = np.full(len(ACTIONS), -np.inf)
-    masked_q_values[valid_indices] = q_values[valid_indices]
+    masked_q_values[candidate_indices] = q_values[candidate_indices]
 
     best_q_value = np.max(masked_q_values)
     best_indices = np.flatnonzero(
@@ -175,6 +193,7 @@ def act(self, game_state: dict) -> str:
     )
     action_index = int(np.random.choice(best_indices))
     chosen_action = ACTIONS[action_index]
+    _remember_own_bomb_if_selected(self, chosen_action, game_state)
 
     self.logger.debug(
         f"Exploitation: selected {chosen_action}, "
@@ -184,13 +203,155 @@ def act(self, game_state: dict) -> str:
     _trace_decision(
         game_state,
         features,
-        valid_indices,
+        candidate_indices,
         q_values,
         chosen_action,
         "exploit",
     )
 
     return chosen_action
+
+
+def _remember_own_bomb_if_selected(
+    self,
+    chosen_action: str,
+    game_state: dict,
+) -> None:
+    """Remember the position where this agent chose to place a bomb."""
+    if chosen_action == "BOMB":
+        self.last_own_bomb_position = tuple(game_state["self"][3])
+
+
+def _clear_inactive_own_bomb_memory(
+    self,
+    game_state: dict,
+) -> None:
+    """Forget own-bomb memory once the remembered bomb is no longer active."""
+    remembered_position = getattr(
+        self,
+        "last_own_bomb_position",
+        None,
+    )
+
+    if remembered_position is None:
+        return
+
+    active_bomb_positions = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+
+    if remembered_position not in active_bomb_positions:
+        self.last_own_bomb_position = None
+
+
+def _post_bomb_candidate_indices(
+    self,
+    game_state: dict,
+    valid_indices: list[int],
+) -> list[int]:
+    """Apply minimal escape commitment while this agent's own bomb is active."""
+    remembered_position = getattr(
+        self,
+        "last_own_bomb_position",
+        None,
+    )
+
+    if remembered_position is None:
+        return valid_indices
+
+    bombs = [
+        (tuple(position), int(timer))
+        for position, timer in game_state.get("bombs", [])
+    ]
+    active_bomb_positions = {
+        position
+        for position, _timer in bombs
+    }
+
+    if remembered_position not in active_bomb_positions:
+        self.last_own_bomb_position = None
+        return valid_indices
+
+    field = game_state["field"]
+    current_position = tuple(game_state["self"][3])
+    danger_times = earliest_danger_times(game_state)
+    remembered_blast = set(
+        blast_tiles(field, remembered_position)
+    )
+
+    movement_indices = [0, 1, 2, 3]
+    wait_index = ACTIONS.index("WAIT")
+
+    if current_position in remembered_blast:
+        escape_candidates: set[int] = set()
+
+        direction_index, distance = nearest_safe_path(game_state)
+
+        if (
+            direction_index is not None
+            and distance is not None
+            and distance > 0
+            and direction_index in valid_indices
+        ):
+            escape_candidates.add(direction_index)
+
+        for action_index in movement_indices:
+            if action_index not in valid_indices:
+                continue
+
+            action = ACTIONS[action_index]
+            dx, dy = DIRECTIONS[action]
+            next_position = (
+                current_position[0] + dx,
+                current_position[1] + dy,
+            )
+
+            if np.isinf(danger_times[next_position]):
+                escape_candidates.add(action_index)
+
+        if escape_candidates:
+            return sorted(escape_candidates)
+
+        return valid_indices
+
+    filtered_indices = []
+
+    for action_index in valid_indices:
+        if action_index in movement_indices:
+            action = ACTIONS[action_index]
+            dx, dy = DIRECTIONS[action]
+            next_position = (
+                current_position[0] + dx,
+                current_position[1] + dy,
+            )
+
+            reenters_own_danger = (
+                next_position in remembered_blast
+                and not tile_is_safe_at_time(
+                    danger_times[next_position],
+                    arrival_time=1,
+                )
+            )
+
+            if reenters_own_danger:
+                continue
+
+        filtered_indices.append(action_index)
+
+    if (
+        wait_index in filtered_indices
+        and not tile_is_safe_at_time(
+            danger_times[current_position],
+            arrival_time=1,
+        )
+    ):
+        filtered_indices.remove(wait_index)
+
+    if filtered_indices:
+        return filtered_indices
+
+    return valid_indices
 
 
 def _trace_decision(
