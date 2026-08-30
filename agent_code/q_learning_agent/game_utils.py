@@ -16,6 +16,15 @@ DIRECTIONS = (
     (-1, 0),
 )
 
+ACTION_DELTAS = {
+    "UP": (0, -1),
+    "RIGHT": (1, 0),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+    "WAIT": (0, 0),
+    "BOMB": (0, 0),
+}
+
 
 def blast_tiles(
     field: np.ndarray,
@@ -163,6 +172,427 @@ def tile_is_safe_at_time(
         arrival_time < explosion_time
         or arrival_time > dangerous_until
     )
+
+
+def safety_blast_tiles(
+    field: np.ndarray,
+    bomb_position: tuple[int, int],
+) -> list[tuple[int, int]]:
+    """Return blast tiles using the rules implemented by the game engine.
+
+    The engine stops explosions at stone walls but does not stop them at
+    crates.  The learned feature helpers intentionally keep their historical
+    ``blast_tiles`` semantics; this engine-accurate variant is used only by
+    the inference-time survivability shield.
+    """
+    bomb_x, bomb_y = bomb_position
+    width, height = field.shape
+    affected_tiles = [(bomb_x, bomb_y)]
+
+    for dx, dy in DIRECTIONS:
+        for distance in range(1, s.BOMB_POWER + 1):
+            position = (
+                bomb_x + dx * distance,
+                bomb_y + dy * distance,
+            )
+            x, y = position
+
+            if not (0 <= x < width and 0 <= y < height):
+                break
+
+            if field[position] == -1:
+                break
+
+            affected_tiles.append(position)
+
+    return affected_tiles
+
+
+def _effective_safety_bomb_timers(
+    field: np.ndarray,
+    bombs: list[tuple[tuple[int, int], int]],
+    explosion_map: np.ndarray | None,
+) -> list[float]:
+    """Return conservative bomb timers for the survivability shield."""
+    timers = [float(timer) for _position, timer in bombs]
+
+    if explosion_map is not None:
+        active_explosion = np.asarray(explosion_map) > 0
+
+        for index, (position, _timer) in enumerate(bombs):
+            if active_explosion[position]:
+                timers[index] = 0.0
+
+    changed = True
+
+    while changed:
+        changed = False
+
+        for source_index, (source_position, _timer) in enumerate(bombs):
+            source_blast = set(
+                safety_blast_tiles(field, source_position)
+            )
+            source_timer = timers[source_index]
+
+            for target_index, (target_position, _timer) in enumerate(bombs):
+                if target_position not in source_blast:
+                    continue
+
+                if timers[target_index] > source_timer:
+                    timers[target_index] = source_timer
+                    changed = True
+
+    return timers
+
+
+def time_indexed_danger_schedule(
+    game_state: dict,
+    additional_bombs: Iterable[
+        tuple[tuple[int, int], int]
+    ] | None = None,
+    horizon: int | None = None,
+) -> np.ndarray:
+    """Return whether every tile is dangerous at each future action time.
+
+    Index zero represents the current decision state.  Index one represents
+    the board after the action selected now has been executed and world
+    elements have advanced once.  Unlike ``earliest_danger_times``, this
+    schedule preserves separate explosion windows from multiple bombs.
+    """
+    field = game_state["field"]
+    explosion_map = game_state.get("explosion_map")
+    bombs = [
+        (tuple(position), int(timer))
+        for position, timer in game_state.get("bombs", [])
+    ]
+
+    if additional_bombs is not None:
+        bombs.extend(
+            (tuple(position), int(timer))
+            for position, timer in additional_bombs
+        )
+
+    effective_timers = _effective_safety_bomb_timers(
+        field,
+        bombs,
+        explosion_map,
+    )
+
+    latest_bomb_danger = max(
+        (
+            int(timer) + s.EXPLOSION_TIMER
+            for timer in effective_timers
+        ),
+        default=0,
+    )
+
+    active_explosion_steps = 0
+    if explosion_map is not None and np.size(explosion_map):
+        active_explosion_steps = int(
+            np.ceil(np.max(np.asarray(explosion_map)))
+        )
+
+    if horizon is None:
+        horizon = max(
+            s.BOMB_TIMER + s.EXPLOSION_TIMER,
+            latest_bomb_danger,
+            active_explosion_steps,
+        )
+
+    if horizon < 1:
+        raise ValueError("horizon must be at least one future action")
+
+    danger = np.zeros(
+        (horizon + 1, *field.shape),
+        dtype=bool,
+    )
+
+    if explosion_map is not None:
+        remaining = np.asarray(explosion_map)
+
+        for time_step in range(1, horizon + 1):
+            danger[time_step] |= remaining >= time_step
+
+    for (bomb_position, _timer), effective_timer in zip(
+        bombs,
+        effective_timers,
+    ):
+        explosion_time = int(effective_timer) + 1
+        dangerous_until = (
+            explosion_time + s.EXPLOSION_TIMER - 1
+        )
+
+        for time_step in range(
+            max(explosion_time, 1),
+            min(dangerous_until, horizon) + 1,
+        ):
+            for position in safety_blast_tiles(
+                field,
+                bomb_position,
+            ):
+                danger[time_step, position[0], position[1]] = True
+
+    return danger
+
+
+def action_has_survival_route(
+    game_state: dict,
+    action: str,
+    horizon: int | None = None,
+) -> bool:
+    """Return whether an action leaves a route through all known danger.
+
+    The search uses ``(position, time)`` states, so waiting and revisiting a
+    tile after an explosion are represented correctly.  Opponent positions
+    are treated as blocked for the short planning horizon.  The caller keeps
+    a non-empty fallback if every candidate is rejected.
+    """
+    if action not in ACTION_DELTAS:
+        raise ValueError(f"Unknown action: {action}")
+
+    field = game_state["field"]
+    width, height = field.shape
+    start_position = tuple(game_state["self"][3])
+    additional_bombs = None
+
+    if action == "BOMB":
+        additional_bombs = [
+            (start_position, int(s.BOMB_TIMER))
+        ]
+
+    danger = time_indexed_danger_schedule(
+        game_state,
+        additional_bombs=additional_bombs,
+        horizon=horizon,
+    )
+    final_time = danger.shape[0] - 1
+
+    bombs = [
+        (tuple(position), int(timer))
+        for position, timer in game_state.get("bombs", [])
+    ]
+    if additional_bombs is not None:
+        bombs.extend(additional_bombs)
+
+    effective_timers = _effective_safety_bomb_timers(
+        field,
+        bombs,
+        game_state.get("explosion_map"),
+    )
+    bomb_blocked_until = {
+        position: int(timer) + 1
+        for (position, _timer), timer in zip(
+            bombs,
+            effective_timers,
+        )
+    }
+    opponent_positions = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+
+    dx, dy = ACTION_DELTAS[action]
+    first_position = (
+        start_position[0] + dx,
+        start_position[1] + dy,
+    )
+
+    if not (
+        0 <= first_position[0] < width
+        and 0 <= first_position[1] < height
+    ):
+        return False
+
+    if field[first_position] != 0:
+        return False
+
+    if first_position in opponent_positions:
+        return False
+
+    first_blocked_until = bomb_blocked_until.get(first_position)
+    if (
+        first_blocked_until is not None
+        and first_position != start_position
+        and 1 <= first_blocked_until
+    ):
+        return False
+
+    if danger[1, first_position[0], first_position[1]]:
+        return False
+
+    reachable_positions = {first_position}
+    search_deltas = (*DIRECTIONS, (0, 0))
+
+    for time_step in range(2, final_time + 1):
+        next_reachable_positions = set()
+
+        for position in reachable_positions:
+            for move_dx, move_dy in search_deltas:
+                next_position = (
+                    position[0] + move_dx,
+                    position[1] + move_dy,
+                )
+                x, y = next_position
+
+                if not (0 <= x < width and 0 <= y < height):
+                    continue
+
+                if field[next_position] != 0:
+                    continue
+
+                if next_position in opponent_positions:
+                    continue
+
+                blocked_until = bomb_blocked_until.get(next_position)
+                if (
+                    blocked_until is not None
+                    and next_position != position
+                    and time_step <= blocked_until
+                ):
+                    continue
+
+                if danger[time_step, x, y]:
+                    continue
+
+                next_reachable_positions.add(next_position)
+
+        if not next_reachable_positions:
+            return False
+
+        reachable_positions = next_reachable_positions
+
+    return bool(reachable_positions)
+
+
+def bomb_has_robust_escape_route(
+    game_state: dict,
+    maximum_escape_steps: int = 2,
+) -> bool:
+    """Return whether a new bomb has a short, disruption-tolerant escape.
+
+    A merely possible four-step escape is fragile when an opponent is nearby:
+    one collision can consume the only spare action and turn the bomb into a
+    suicide.  The ordinary time-expanded route is sufficient when every
+    opponent is far away.  Otherwise this gate requires at least two distinct
+    exit tiles outside the engine-accurate blast within
+    ``maximum_escape_steps`` movements.  One opponent cannot occupy both
+    exits at once.
+    """
+    if maximum_escape_steps < 1:
+        raise ValueError("maximum_escape_steps must be positive")
+
+    if not bool(game_state["self"][2]):
+        return False
+
+    field = game_state["field"]
+    width, height = field.shape
+    start_position = tuple(game_state["self"][3])
+
+    if any(
+        tuple(position) == start_position
+        for position, _timer in game_state.get("bombs", [])
+    ):
+        return False
+
+    if not action_has_survival_route(game_state, "BOMB"):
+        return False
+
+    opponent_positions = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+    nearby_opponent = any(
+        abs(position[0] - start_position[0])
+        + abs(position[1] - start_position[1])
+        <= s.BOMB_POWER + 1
+        for position in opponent_positions
+    )
+
+    if not nearby_opponent:
+        return True
+
+    additional_bomb = (
+        start_position,
+        int(s.BOMB_TIMER),
+    )
+    danger = time_indexed_danger_schedule(
+        game_state,
+        additional_bombs=[additional_bomb],
+    )
+
+    if danger[1, start_position[0], start_position[1]]:
+        return False
+
+    bombs = [
+        (tuple(position), int(timer))
+        for position, timer in game_state.get("bombs", [])
+    ]
+    bombs.append(additional_bomb)
+    effective_timers = _effective_safety_bomb_timers(
+        field,
+        bombs,
+        game_state.get("explosion_map"),
+    )
+    bomb_blocked_until = {
+        position: int(timer) + 1
+        for (position, _timer), timer in zip(
+            bombs,
+            effective_timers,
+        )
+    }
+    own_blast = set(
+        safety_blast_tiles(field, start_position)
+    )
+    reachable_positions = {start_position}
+    safe_exit_positions = set()
+
+    for movement_step in range(1, maximum_escape_steps + 1):
+        time_step = movement_step + 1
+        next_reachable_positions = set()
+
+        for position in reachable_positions:
+            for dx, dy in DIRECTIONS:
+                next_position = (
+                    position[0] + dx,
+                    position[1] + dy,
+                )
+                x, y = next_position
+
+                if not (0 <= x < width and 0 <= y < height):
+                    continue
+
+                if field[next_position] != 0:
+                    continue
+
+                if next_position in opponent_positions:
+                    continue
+
+                blocked_until = bomb_blocked_until.get(next_position)
+                if (
+                    blocked_until is not None
+                    and next_position != position
+                    and time_step <= blocked_until
+                ):
+                    continue
+
+                if danger[time_step, x, y]:
+                    continue
+
+                if next_position not in own_blast:
+                    safe_exit_positions.add(next_position)
+                    continue
+
+                next_reachable_positions.add(next_position)
+
+        if len(safe_exit_positions) >= 2:
+            return True
+
+        if not next_reachable_positions:
+            break
+
+        reachable_positions = next_reachable_positions
+
+    return len(safe_exit_positions) >= 2
 
 
 def nearest_safe_path(

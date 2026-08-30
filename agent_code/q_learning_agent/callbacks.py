@@ -8,14 +8,17 @@ import numpy as np
 import settings as s
 
 from .game_utils import (
+    action_has_survival_route,
     best_crate_bombing_path,
     blast_tiles,
+    bomb_has_robust_escape_route,
     bomb_target_counts,
     earliest_danger_times,
     has_escape_route_after_bomb,
     nearest_crate_bombing_path,
     nearest_safe_path,
     tile_is_safe_at_time,
+    time_indexed_danger_schedule,
 )
 
 
@@ -53,6 +56,12 @@ DIRECTIONS = {
 # 38: normalized crate yield at the best nearby position
 FEATURE_DIM = 39
 
+# A safe agent must also make progress.  If the learned policy selects WAIT
+# three times at the same safe position, temporarily remove WAIT when the
+# existing safety filters have already approved a move toward a coin or crate
+# objective.
+ANTI_STALL_WAIT_LIMIT = 3
+
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
 
@@ -73,6 +82,8 @@ def setup(self):
     self.episodes_trained = 0
     self.last_own_bomb_position = None
     self.last_seen_round = None
+    self.consecutive_safe_waits = 0
+    self.last_wait_position = None
 
     if not self.model_path.is_file():
         self.logger.info("No saved model found. Starting from scratch.")
@@ -153,21 +164,33 @@ def act(self, game_state: dict) -> str:
     if getattr(self, "last_seen_round", None) != current_round:
         self.last_seen_round = current_round
         self.last_own_bomb_position = None
+        self.consecutive_safe_waits = 0
+        self.last_wait_position = None
 
     _clear_inactive_own_bomb_memory(self, game_state)
 
     features = state_to_features(game_state)
     valid_indices = valid_action_indices(game_state)
+    survivable_indices = _time_expanded_candidate_indices(
+        game_state,
+        valid_indices,
+    )
     candidate_indices = _post_bomb_candidate_indices(
         self,
         game_state,
-        valid_indices,
+        survivable_indices,
+    )
+    candidate_indices = _anti_stall_candidate_indices(
+        self,
+        game_state,
+        candidate_indices,
     )
 
     if self.train and random.random() < self.epsilon:
         action_index = random.choice(candidate_indices)
         chosen_action = ACTIONS[action_index]
         _remember_own_bomb_if_selected(self, chosen_action, game_state)
+        _record_anti_stall_choice(self, chosen_action, game_state)
         self.logger.debug(
             f"Exploration: selected {chosen_action} "
             f"with epsilon={self.epsilon:.3f}"
@@ -194,6 +217,7 @@ def act(self, game_state: dict) -> str:
     action_index = int(np.random.choice(best_indices))
     chosen_action = ACTIONS[action_index]
     _remember_own_bomb_if_selected(self, chosen_action, game_state)
+    _record_anti_stall_choice(self, chosen_action, game_state)
 
     self.logger.debug(
         f"Exploitation: selected {chosen_action}, "
@@ -210,6 +234,104 @@ def act(self, game_state: dict) -> str:
     )
 
     return chosen_action
+
+
+def _current_position_has_known_danger(game_state: dict) -> bool:
+    """Return whether known danger will reach the current tile."""
+    position = tuple(game_state["self"][3])
+    danger = time_indexed_danger_schedule(game_state)
+    return bool(np.any(danger[1:, position[0], position[1]]))
+
+
+def _progress_direction_index(game_state: dict) -> int | None:
+    """Return the first movement direction toward the active objective."""
+    if game_state.get("coins", []):
+        direction_index, distance = nearest_coin_path(game_state)
+
+        if direction_index is not None and distance not in (None, 0):
+            return int(direction_index)
+
+    # A visible but currently unreachable coin must not suppress crate
+    # progress.  Opening the board is the only way to reach it.
+    direction_index, distance = nearest_crate_bombing_path(game_state)
+
+    if direction_index is None or distance in (None, 0):
+        return None
+
+    return int(direction_index)
+
+
+def _anti_stall_candidate_indices(
+    self,
+    game_state: dict,
+    candidate_indices: list[int],
+) -> list[int]:
+    """Break repeated safe WAIT loops without weakening safety filters.
+
+    This guard runs after the time-expanded and own-bomb filters.  It removes
+    WAIT only when the agent has already waited at least three times at the
+    same position, no known explosion reaches that position, and the approved
+    candidate set contains the first move toward a visible coin or a safe
+    crate-bombing tile.
+    """
+    wait_index = ACTIONS.index("WAIT")
+
+    if wait_index not in candidate_indices:
+        return candidate_indices
+
+    if (
+        getattr(self, "consecutive_safe_waits", 0)
+        < ANTI_STALL_WAIT_LIMIT
+    ):
+        return candidate_indices
+
+    current_position = tuple(game_state["self"][3])
+    if getattr(self, "last_wait_position", None) != current_position:
+        return candidate_indices
+
+    if _current_position_has_known_danger(game_state):
+        return candidate_indices
+
+    progress_index = _progress_direction_index(game_state)
+    if progress_index not in candidate_indices:
+        return candidate_indices
+
+    filtered_indices = [
+        action_index
+        for action_index in candidate_indices
+        if action_index != wait_index
+    ]
+
+    return filtered_indices or candidate_indices
+
+
+def _record_anti_stall_choice(
+    self,
+    chosen_action: str,
+    game_state: dict,
+) -> None:
+    """Remember consecutive safe WAIT selections at one position."""
+    current_position = tuple(game_state["self"][3])
+
+    if (
+        chosen_action == "WAIT"
+        and not _current_position_has_known_danger(game_state)
+    ):
+        if (
+            getattr(self, "last_wait_position", None)
+            == current_position
+        ):
+            self.consecutive_safe_waits = (
+                getattr(self, "consecutive_safe_waits", 0) + 1
+            )
+        else:
+            self.consecutive_safe_waits = 1
+
+        self.last_wait_position = current_position
+        return
+
+    self.consecutive_safe_waits = 0
+    self.last_wait_position = None
 
 
 def _remember_own_bomb_if_selected(
@@ -350,6 +472,62 @@ def _post_bomb_candidate_indices(
 
     if filtered_indices:
         return filtered_indices
+
+    return valid_indices
+
+
+def _time_expanded_candidate_indices(
+    game_state: dict,
+    valid_indices: list[int],
+) -> list[int]:
+    """Remove actions that have no route through currently known danger.
+
+    The learned feature vector and Q-values remain unchanged.  This function
+    filters only the final candidate set and always falls back to the original
+    non-empty set when the short-horizon model cannot find a survivor.
+    """
+    if not valid_indices:
+        return valid_indices
+
+    explosion_map = game_state.get("explosion_map")
+    active_explosion = (
+        explosion_map is not None
+        and bool(np.any(np.asarray(explosion_map) > 0))
+    )
+    bomb_index = ACTIONS.index("BOMB")
+    requires_check = (
+        bool(game_state.get("bombs", []))
+        or active_explosion
+        or bomb_index in valid_indices
+    )
+
+    if not requires_check:
+        return valid_indices
+
+    survivable_indices = [
+        action_index
+        for action_index in valid_indices
+        if (
+            bomb_has_robust_escape_route(game_state)
+            if ACTIONS[action_index] == "BOMB"
+            else action_has_survival_route(
+                game_state,
+                ACTIONS[action_index],
+            )
+        )
+    ]
+
+    if survivable_indices:
+        return survivable_indices
+
+    non_bomb_indices = [
+        action_index
+        for action_index in valid_indices
+        if ACTIONS[action_index] != "BOMB"
+    ]
+
+    if non_bomb_indices:
+        return non_bomb_indices
 
     return valid_indices
 
