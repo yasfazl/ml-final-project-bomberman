@@ -62,6 +62,11 @@ FEATURE_DIM = 39
 # objective.
 ANTI_STALL_WAIT_LIMIT = 3
 
+# Moving first must provide a material improvement.  A one-crate gain was too
+# common in smoke evaluation and reduced score by delaying otherwise useful
+# bombs; a gain of two keeps the guard focused on clear 1 -> 3 opportunities.
+CRATE_DEFERRAL_MIN_GAIN = 2
+
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
 
@@ -180,6 +185,10 @@ def act(self, game_state: dict) -> str:
         game_state,
         survivable_indices,
     )
+    candidate_indices = _crate_bomb_deferral_candidate_indices(
+        game_state,
+        candidate_indices,
+    )
     candidate_indices = _anti_stall_candidate_indices(
         self,
         game_state,
@@ -259,6 +268,94 @@ def _progress_direction_index(game_state: dict) -> int | None:
         return None
 
     return int(direction_index)
+
+
+def _state_after_movement(
+    game_state: dict,
+    direction_index: int,
+) -> dict:
+    """Return a shallow state copy with the agent moved one tile."""
+    action = ACTIONS[direction_index]
+    dx, dy = DIRECTIONS[action]
+    current_position = tuple(game_state["self"][3])
+    next_position = (
+        current_position[0] + dx,
+        current_position[1] + dy,
+    )
+
+    simulated_state = dict(game_state)
+    agent_info = list(game_state["self"])
+    agent_info[3] = next_position
+    simulated_state["self"] = tuple(agent_info)
+    return simulated_state
+
+
+def _crate_bomb_deferral_candidate_indices(
+    game_state: dict,
+    candidate_indices: list[int],
+) -> list[int]:
+    """Move one tile before bombing when it safely improves crate yield.
+
+    This is intentionally restricted to safe crate mode.  It never defers an
+    opponent-targeting bomb, never runs when known danger reaches the current
+    tile, and never interrupts pursuit of a reachable coin.  Distant bombs do
+    not disable the optimization.  The selected movement must already have
+    survived the ordinary candidate filters, and placing a bomb at the
+    destination must pass the robust escape check.
+    """
+    bomb_index = ACTIONS.index("BOMB")
+    if bomb_index not in candidate_indices:
+        return candidate_indices
+
+    if _current_position_has_known_danger(game_state):
+        return candidate_indices
+
+    coin_direction, coin_distance = nearest_coin_path(game_state)
+    if coin_direction is not None and coin_distance not in (None, 0):
+        return candidate_indices
+
+    current_crate_count, current_opponent_count = bomb_target_counts(
+        game_state
+    )
+    if current_crate_count < 1 or current_opponent_count > 0:
+        return candidate_indices
+
+    (
+        better_direction,
+        better_distance,
+        better_crate_count,
+    ) = best_crate_bombing_path(
+        game_state,
+        max_search_distance=1,
+    )
+
+    if (
+        better_direction is None
+        or better_distance != 1
+        or (
+            better_crate_count - current_crate_count
+            < CRATE_DEFERRAL_MIN_GAIN
+        )
+        or better_direction not in candidate_indices
+    ):
+        return candidate_indices
+
+    simulated_state = _state_after_movement(
+        game_state,
+        int(better_direction),
+    )
+    simulated_crate_count, _ = bomb_target_counts(simulated_state)
+
+    if (
+        simulated_crate_count - current_crate_count
+        < CRATE_DEFERRAL_MIN_GAIN
+    ):
+        return candidate_indices
+
+    if not bomb_has_robust_escape_route(simulated_state):
+        return candidate_indices
+
+    return [int(better_direction)]
 
 
 def _anti_stall_candidate_indices(
