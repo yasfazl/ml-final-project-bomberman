@@ -117,3 +117,5 @@ results/
 
 # Runtime logs
 logs/
+# Local training checkpoints
+checkpoints/
