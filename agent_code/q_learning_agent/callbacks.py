@@ -1,9 +1,25 @@
 from collections import deque
 from pathlib import Path
+import os
 import pickle
 import random
 
 import numpy as np
+import settings as s
+
+from .game_utils import (
+    action_has_survival_route,
+    best_crate_bombing_path,
+    blast_tiles,
+    bomb_has_robust_escape_route,
+    bomb_target_counts,
+    earliest_danger_times,
+    has_escape_route_after_bomb,
+    nearest_crate_bombing_path,
+    nearest_safe_path,
+    tile_is_safe_at_time,
+    time_indexed_danger_schedule,
+)
 
 
 ACTIONS = ["UP", "RIGHT", "DOWN", "LEFT", "WAIT", "BOMB"]
@@ -16,13 +32,35 @@ DIRECTIONS = {
     "DOWN": (0, 1),
     "LEFT": (-1, 0),
 }
+
 # Feature vector:
 # 0: bias
 # 1-4: whether UP, RIGHT, DOWN, LEFT are valid
 # 5: whether at least one visible coin exists
 # 6-9: first direction of the shortest path to a coin
 # 10: normalized distance to the nearest reachable coin
-FEATURE_DIM = 11
+# 11: danger urgency at the current position
+# 12-16: danger urgency after UP, RIGHT, DOWN, LEFT, WAIT
+# 17: whether the agent currently has a bomb available
+# 18: whether placing a bomb leaves a timed escape route
+# 19: normalized number of crates hit by a bomb placed here
+# 20: whether an opponent would be hit by a bomb placed here
+# 21-24: first direction of the shortest safe escape path
+# 25: normalized distance along that escape path
+# 26: whether a reachable safe crate-bombing tile exists
+# 27-30: first direction toward that crate-bombing tile
+# 31: normalized distance to that crate-bombing tile
+# 32: whether a better nearby safe crate-bombing position exists
+# 33-36: first direction toward that better position
+# 37: normalized distance to that better position
+# 38: normalized crate yield at the best nearby position
+FEATURE_DIM = 39
+
+# A safe agent must also make progress.  If the learned policy selects WAIT
+# three times at the same safe position, temporarily remove WAIT when the
+# existing safety filters have already approved a move toward a coin or crate
+# objective.
+ANTI_STALL_WAIT_LIMIT = 3
 
 MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
@@ -31,114 +69,542 @@ def setup(self):
     """
     Initialize or load the Q-learning model.
 
-    The model contains one weight vector for each action:
-        model.shape == (number_of_actions, number_of_features)
+    Smaller compatible models are migrated to FEATURE_DIM features by
+    preserving their old weights and initializing new weights to zero.
     """
     self.model_path = MODEL_PATH
 
-    # Defaults for a new model.
-    self.model = np.zeros((len(ACTIONS), FEATURE_DIM), dtype=np.float64)
+    self.model = np.zeros(
+        (len(ACTIONS), FEATURE_DIM),
+        dtype=np.float64,
+    )
     self.epsilon = 1.0
     self.episodes_trained = 0
+    self.last_own_bomb_position = None
+    self.last_seen_round = None
+    self.consecutive_safe_waits = 0
+    self.last_wait_position = None
 
-    if self.model_path.is_file():
-        try:
-            with self.model_path.open("rb") as file:
-                saved_data = pickle.load(file)
+    if not self.model_path.is_file():
+        self.logger.info("No saved model found. Starting from scratch.")
+        return
 
-            saved_weights = saved_data["weights"]
+    try:
+        with self.model_path.open("rb") as file:
+            saved_data = pickle.load(file)
 
-            expected_shape = (len(ACTIONS), FEATURE_DIM)
-            if saved_weights.shape != expected_shape:
-                raise ValueError(
-                    f"Expected model shape {expected_shape}, "
-                    f"but found {saved_weights.shape}."
-                )
+        saved_weights = np.asarray(
+            saved_data["weights"],
+            dtype=np.float64,
+        )
 
-            self.model = saved_weights
-            self.epsilon = saved_data.get("epsilon", 1.0)
-            self.episodes_trained = saved_data.get("episodes_trained", 0)
+        if saved_weights.ndim != 2:
+            raise ValueError(
+                f"Expected a two-dimensional model, found "
+                f"shape {saved_weights.shape}."
+            )
+
+        if saved_weights.shape[0] != len(ACTIONS):
+            raise ValueError(
+                f"Expected {len(ACTIONS)} action rows, found "
+                f"shape {saved_weights.shape}."
+            )
+
+        if saved_weights.shape[1] > FEATURE_DIM:
+            raise ValueError(
+                f"Saved model has {saved_weights.shape[1]} features, "
+                f"but this agent expects {FEATURE_DIM}."
+            )
+
+        if saved_weights.shape[1] < FEATURE_DIM:
+            old_feature_dimension = saved_weights.shape[1]
+            migrated_weights = np.zeros(
+                (len(ACTIONS), FEATURE_DIM),
+                dtype=np.float64,
+            )
+            migrated_weights[:, :old_feature_dimension] = saved_weights
+            saved_weights = migrated_weights
 
             self.logger.info(
-                f"Loaded Q-learning model after "
-                f"{self.episodes_trained} training episodes."
+                f"Migrated model from {old_feature_dimension} "
+                f"to {FEATURE_DIM} features."
             )
 
-        except (OSError, KeyError, TypeError, ValueError, pickle.PickleError) as error:
-            self.logger.warning(
-                f"Could not load saved model: {error}. "
-                "Starting with a new model."
-            )
-    else:
-        self.logger.info("No saved model found. Starting from scratch.")
+        self.model = saved_weights
+        self.epsilon = float(saved_data.get("epsilon", 1.0))
+        self.episodes_trained = int(
+            saved_data.get("episodes_trained", 0)
+        )
+
+        self.logger.info(
+            f"Loaded Q-learning model after "
+            f"{self.episodes_trained} training episodes."
+        )
+
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        ValueError,
+        pickle.PickleError,
+    ) as error:
+        self.logger.warning(
+            f"Could not load saved model: {error}. "
+            "Starting with a new model."
+        )
 
 
 def act(self, game_state: dict) -> str:
-    """
-    Select an action using an epsilon-greedy strategy.
-
-    During training:
-        - with probability epsilon, explore using a random valid action;
-        - otherwise, choose the valid action with the highest Q-value.
-
-    During evaluation:
-        - always choose the valid action with the highest Q-value.
-    """
+    """Select an action using an epsilon-greedy strategy."""
     if game_state is None:
         return "WAIT"
 
+    current_round = game_state.get("round")
+
+    if getattr(self, "last_seen_round", None) != current_round:
+        self.last_seen_round = current_round
+        self.last_own_bomb_position = None
+        self.consecutive_safe_waits = 0
+        self.last_wait_position = None
+
+    _clear_inactive_own_bomb_memory(self, game_state)
+
     features = state_to_features(game_state)
     valid_indices = valid_action_indices(game_state)
+    survivable_indices = _time_expanded_candidate_indices(
+        game_state,
+        valid_indices,
+    )
+    candidate_indices = _post_bomb_candidate_indices(
+        self,
+        game_state,
+        survivable_indices,
+    )
+    candidate_indices = _anti_stall_candidate_indices(
+        self,
+        game_state,
+        candidate_indices,
+    )
 
-    # Exploration is only used during training.
     if self.train and random.random() < self.epsilon:
-        action_index = random.choice(valid_indices)
+        action_index = random.choice(candidate_indices)
+        chosen_action = ACTIONS[action_index]
+        _remember_own_bomb_if_selected(self, chosen_action, game_state)
+        _record_anti_stall_choice(self, chosen_action, game_state)
         self.logger.debug(
-            f"Exploration: selected {ACTIONS[action_index]} "
+            f"Exploration: selected {chosen_action} "
             f"with epsilon={self.epsilon:.3f}"
         )
-        return ACTIONS[action_index]
+        _trace_decision(
+            game_state,
+            features,
+            candidate_indices,
+            None,
+            chosen_action,
+            "explore",
+        )
+        return chosen_action
 
-    # The linear model calculates one Q-value for each action.
     q_values = self.model @ features
 
-    # Invalid actions must not be selected.
     masked_q_values = np.full(len(ACTIONS), -np.inf)
-    masked_q_values[valid_indices] = q_values[valid_indices]
+    masked_q_values[candidate_indices] = q_values[candidate_indices]
 
     best_q_value = np.max(masked_q_values)
-
-    # Random tie-breaking prevents a fixed preference when Q-values are equal.
     best_indices = np.flatnonzero(
         np.isclose(masked_q_values, best_q_value)
     )
     action_index = int(np.random.choice(best_indices))
+    chosen_action = ACTIONS[action_index]
+    _remember_own_bomb_if_selected(self, chosen_action, game_state)
+    _record_anti_stall_choice(self, chosen_action, game_state)
 
     self.logger.debug(
-        f"Exploitation: selected {ACTIONS[action_index]}, "
+        f"Exploitation: selected {chosen_action}, "
         f"Q-values={q_values}"
     )
 
-    return ACTIONS[action_index]
+    _trace_decision(
+        game_state,
+        features,
+        candidate_indices,
+        q_values,
+        chosen_action,
+        "exploit",
+    )
+
+    return chosen_action
+
+
+def _current_position_has_known_danger(game_state: dict) -> bool:
+    """Return whether known danger will reach the current tile."""
+    position = tuple(game_state["self"][3])
+    danger = time_indexed_danger_schedule(game_state)
+    return bool(np.any(danger[1:, position[0], position[1]]))
+
+
+def _progress_direction_index(game_state: dict) -> int | None:
+    """Return the first movement direction toward the active objective."""
+    if game_state.get("coins", []):
+        direction_index, distance = nearest_coin_path(game_state)
+
+        if direction_index is not None and distance not in (None, 0):
+            return int(direction_index)
+
+    # A visible but currently unreachable coin must not suppress crate
+    # progress.  Opening the board is the only way to reach it.
+    direction_index, distance = nearest_crate_bombing_path(game_state)
+
+    if direction_index is None or distance in (None, 0):
+        return None
+
+    return int(direction_index)
+
+
+def _anti_stall_candidate_indices(
+    self,
+    game_state: dict,
+    candidate_indices: list[int],
+) -> list[int]:
+    """Break repeated safe WAIT loops without weakening safety filters.
+
+    This guard runs after the time-expanded and own-bomb filters.  It removes
+    WAIT only when the agent has already waited at least three times at the
+    same position, no known explosion reaches that position, and the approved
+    candidate set contains the first move toward a visible coin or a safe
+    crate-bombing tile.
+    """
+    wait_index = ACTIONS.index("WAIT")
+
+    if wait_index not in candidate_indices:
+        return candidate_indices
+
+    if (
+        getattr(self, "consecutive_safe_waits", 0)
+        < ANTI_STALL_WAIT_LIMIT
+    ):
+        return candidate_indices
+
+    current_position = tuple(game_state["self"][3])
+    if getattr(self, "last_wait_position", None) != current_position:
+        return candidate_indices
+
+    if _current_position_has_known_danger(game_state):
+        return candidate_indices
+
+    progress_index = _progress_direction_index(game_state)
+    if progress_index not in candidate_indices:
+        return candidate_indices
+
+    filtered_indices = [
+        action_index
+        for action_index in candidate_indices
+        if action_index != wait_index
+    ]
+
+    return filtered_indices or candidate_indices
+
+
+def _record_anti_stall_choice(
+    self,
+    chosen_action: str,
+    game_state: dict,
+) -> None:
+    """Remember consecutive safe WAIT selections at one position."""
+    current_position = tuple(game_state["self"][3])
+
+    if (
+        chosen_action == "WAIT"
+        and not _current_position_has_known_danger(game_state)
+    ):
+        if (
+            getattr(self, "last_wait_position", None)
+            == current_position
+        ):
+            self.consecutive_safe_waits = (
+                getattr(self, "consecutive_safe_waits", 0) + 1
+            )
+        else:
+            self.consecutive_safe_waits = 1
+
+        self.last_wait_position = current_position
+        return
+
+    self.consecutive_safe_waits = 0
+    self.last_wait_position = None
+
+
+def _remember_own_bomb_if_selected(
+    self,
+    chosen_action: str,
+    game_state: dict,
+) -> None:
+    """Remember the position where this agent chose to place a bomb."""
+    if chosen_action == "BOMB":
+        self.last_own_bomb_position = tuple(game_state["self"][3])
+
+
+def _clear_inactive_own_bomb_memory(
+    self,
+    game_state: dict,
+) -> None:
+    """Forget own-bomb memory once the remembered bomb is no longer active."""
+    remembered_position = getattr(
+        self,
+        "last_own_bomb_position",
+        None,
+    )
+
+    if remembered_position is None:
+        return
+
+    active_bomb_positions = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+
+    if remembered_position not in active_bomb_positions:
+        self.last_own_bomb_position = None
+
+
+def _post_bomb_candidate_indices(
+    self,
+    game_state: dict,
+    valid_indices: list[int],
+) -> list[int]:
+    """Apply minimal escape commitment while this agent's own bomb is active."""
+    remembered_position = getattr(
+        self,
+        "last_own_bomb_position",
+        None,
+    )
+
+    if remembered_position is None:
+        return valid_indices
+
+    bombs = [
+        (tuple(position), int(timer))
+        for position, timer in game_state.get("bombs", [])
+    ]
+    active_bomb_positions = {
+        position
+        for position, _timer in bombs
+    }
+
+    if remembered_position not in active_bomb_positions:
+        self.last_own_bomb_position = None
+        return valid_indices
+
+    field = game_state["field"]
+    current_position = tuple(game_state["self"][3])
+    danger_times = earliest_danger_times(game_state)
+    remembered_blast = set(
+        blast_tiles(field, remembered_position)
+    )
+
+    movement_indices = [0, 1, 2, 3]
+    wait_index = ACTIONS.index("WAIT")
+
+    if current_position in remembered_blast:
+        escape_candidates: set[int] = set()
+
+        direction_index, distance = nearest_safe_path(game_state)
+
+        if (
+            direction_index is not None
+            and distance is not None
+            and distance > 0
+            and direction_index in valid_indices
+        ):
+            escape_candidates.add(direction_index)
+
+        for action_index in movement_indices:
+            if action_index not in valid_indices:
+                continue
+
+            action = ACTIONS[action_index]
+            dx, dy = DIRECTIONS[action]
+            next_position = (
+                current_position[0] + dx,
+                current_position[1] + dy,
+            )
+
+            if np.isinf(danger_times[next_position]):
+                escape_candidates.add(action_index)
+
+        if escape_candidates:
+            return sorted(escape_candidates)
+
+        return valid_indices
+
+    filtered_indices = []
+
+    for action_index in valid_indices:
+        if action_index in movement_indices:
+            action = ACTIONS[action_index]
+            dx, dy = DIRECTIONS[action]
+            next_position = (
+                current_position[0] + dx,
+                current_position[1] + dy,
+            )
+
+            reenters_own_danger = (
+                next_position in remembered_blast
+                and not tile_is_safe_at_time(
+                    danger_times[next_position],
+                    arrival_time=1,
+                )
+            )
+
+            if reenters_own_danger:
+                continue
+
+        filtered_indices.append(action_index)
+
+    if (
+        wait_index in filtered_indices
+        and not tile_is_safe_at_time(
+            danger_times[current_position],
+            arrival_time=1,
+        )
+    ):
+        filtered_indices.remove(wait_index)
+
+    if filtered_indices:
+        return filtered_indices
+
+    return valid_indices
+
+
+def _time_expanded_candidate_indices(
+    game_state: dict,
+    valid_indices: list[int],
+) -> list[int]:
+    """Remove actions that have no route through currently known danger.
+
+    The learned feature vector and Q-values remain unchanged.  This function
+    filters only the final candidate set and always falls back to the original
+    non-empty set when the short-horizon model cannot find a survivor.
+    """
+    if not valid_indices:
+        return valid_indices
+
+    explosion_map = game_state.get("explosion_map")
+    active_explosion = (
+        explosion_map is not None
+        and bool(np.any(np.asarray(explosion_map) > 0))
+    )
+    bomb_index = ACTIONS.index("BOMB")
+    requires_check = (
+        bool(game_state.get("bombs", []))
+        or active_explosion
+        or bomb_index in valid_indices
+    )
+
+    if not requires_check:
+        return valid_indices
+
+    survivable_indices = [
+        action_index
+        for action_index in valid_indices
+        if (
+            bomb_has_robust_escape_route(game_state)
+            if ACTIONS[action_index] == "BOMB"
+            else action_has_survival_route(
+                game_state,
+                ACTIONS[action_index],
+            )
+        )
+    ]
+
+    if survivable_indices:
+        return survivable_indices
+
+    non_bomb_indices = [
+        action_index
+        for action_index in valid_indices
+        if ACTIONS[action_index] != "BOMB"
+    ]
+
+    if non_bomb_indices:
+        return non_bomb_indices
+
+    return valid_indices
+
+
+def _trace_decision(
+    game_state: dict,
+    features: np.ndarray,
+    valid_indices: list[int],
+    q_values: np.ndarray | None,
+    chosen_action: str,
+    mode: str,
+):
+    """Print one diagnostic line when BOMBERMAN_TRACE=1."""
+    if os.environ.get("BOMBERMAN_TRACE") != "1":
+        return
+
+    valid_actions = [ACTIONS[index] for index in valid_indices]
+
+    if q_values is None:
+        valid_q_values = {}
+    else:
+        valid_q_values = {
+            ACTIONS[index]: round(float(q_values[index]), 3)
+            for index in valid_indices
+        }
+
+    coin_direction, coin_distance = nearest_coin_path(game_state)
+    escape_direction, escape_distance = nearest_safe_path(game_state)
+    crate_direction, crate_distance = nearest_crate_bombing_path(
+        game_state
+    )
+    (
+        best_crate_direction,
+        best_crate_distance,
+        best_crate_count,
+    ) = best_crate_bombing_path(
+        game_state,
+    )
+    crate_targets, opponent_targets = bomb_target_counts(game_state)
+
+    print(
+        "[TRACE] "
+        f"step={game_state.get('step')} "
+        f"position={tuple(game_state['self'][3])} "
+        f"bombs={game_state.get('bombs', [])} "
+        f"coin={(coin_direction, coin_distance)} "
+        f"crate={(crate_direction, crate_distance)} "
+        f"best_crate={(best_crate_direction, best_crate_distance, best_crate_count)} "
+        f"escape={(escape_direction, escape_distance)} "
+        f"targets={(crate_targets, opponent_targets)} "
+        f"valid={valid_actions} "
+        f"q={valid_q_values} "
+        f"mode={mode} "
+        f"chosen={chosen_action}",
+        flush=True,
+    )
 
 
 def valid_action_indices(game_state: dict) -> list[int]:
     """
-    Return the indices of currently valid actions.
+    Return physically legal actions plus safe, useful bomb placement.
 
-    For Task 1:
-        - legal movement actions are allowed;
-        - WAIT is allowed;
-        - BOMB is intentionally disabled.
+    BOMB is allowed only when:
+    - the agent has a bomb available;
+    - at least one crate or opponent is in the blast;
+    - a time-aware escape route exists.
     """
     field = game_state["field"]
     x, y = game_state["self"][3]
 
     blocked_positions = {
-        position for position, _timer in game_state["bombs"]
+        position
+        for position, _timer in game_state.get("bombs", [])
     }
     blocked_positions.update(
-        other_agent[3] for other_agent in game_state["others"]
+        other_agent[3]
+        for other_agent in game_state.get("others", [])
     )
 
     valid_indices = []
@@ -153,50 +619,55 @@ def valid_action_indices(game_state: dict) -> list[int]:
         ):
             valid_indices.append(action_index)
 
-    # WAIT is always available.
     valid_indices.append(ACTIONS.index("WAIT"))
 
-    # BOMB is not enabled during Task 1.
+    if bool(game_state["self"][2]):
+        crate_count, opponent_count = bomb_target_counts(game_state)
+        has_target = crate_count > 0 or opponent_count > 0
+
+        if has_target and has_escape_route_after_bomb(game_state):
+            valid_indices.append(ACTIONS.index("BOMB"))
+
     return valid_indices
 
 
+def danger_urgency(danger_time: float) -> float:
+    """Convert an explosion timer into a normalized danger value."""
+    if np.isinf(danger_time):
+        return 0.0
+
+    return 1.0 / (float(danger_time) + 1.0)
+
+
 def state_to_features(game_state: dict) -> np.ndarray | None:
-    """
-    Convert the game state into a low-dimensional feature vector.
-    """
+    """Convert the game state into a low-dimensional feature vector."""
     if game_state is None:
         return None
 
     features = np.zeros(FEATURE_DIM, dtype=np.float64)
-
-    # A constant feature allows the model to learn a general action bias.
     features[0] = 1.0
 
     valid_indices = valid_action_indices(game_state)
 
-    # Features 1-4: valid movement directions.
     for action_index in range(4):
         features[1 + action_index] = float(
             action_index in valid_indices
         )
 
-    coins = game_state["coins"]
+    coins = game_state.get("coins", [])
 
     if coins:
-        # Feature 5: at least one visible coin exists.
         features[5] = 1.0
 
         direction_index, distance = nearest_coin_path(game_state)
 
         if direction_index is not None:
-            # Features 6-9: first direction on the shortest coin path.
             features[6 + direction_index] = 1.0
 
         field = game_state["field"]
         maximum_distance = field.shape[0] + field.shape[1]
 
         if distance is None:
-            # A coin exists but is currently unreachable.
             features[10] = 1.0
         else:
             features[10] = min(
@@ -204,37 +675,142 @@ def state_to_features(game_state: dict) -> np.ndarray | None:
                 1.0,
             )
 
+    danger_times = earliest_danger_times(game_state)
+    current_position = game_state["self"][3]
+
+    features[11] = danger_urgency(
+        danger_times[current_position]
+    )
+
+    safety_actions = ["UP", "RIGHT", "DOWN", "LEFT", "WAIT"]
+
+    for feature_offset, action in enumerate(safety_actions):
+        action_index = ACTIONS.index(action)
+
+        if action == "WAIT":
+            next_position = current_position
+        else:
+            dx, dy = DIRECTIONS[action]
+            next_position = (
+                current_position[0] + dx,
+                current_position[1] + dy,
+            )
+
+        if action != "WAIT" and action_index not in valid_indices:
+            # Walls, crates, bombs, and opponents make a movement unusable.
+            features[12 + feature_offset] = 1.0
+        else:
+            features[12 + feature_offset] = danger_urgency(
+                danger_times[next_position]
+            )
+
+    bomb_available = bool(game_state["self"][2])
+    features[17] = float(bomb_available)
+
+    if bomb_available:
+        safe_bomb = has_escape_route_after_bomb(game_state)
+        crate_count, opponent_count = bomb_target_counts(game_state)
+
+        features[18] = float(safe_bomb)
+        features[19] = min(crate_count / 4.0, 1.0)
+        features[20] = float(opponent_count > 0)
+
+    escape_direction, escape_distance = nearest_safe_path(game_state)
+
+    if escape_direction is not None:
+        features[21 + escape_direction] = 1.0
+
+    if escape_distance not in (None, 0):
+        features[25] = min(
+            escape_distance / max(float(s.BOMB_TIMER), 1.0),
+            1.0,
+        )
+
+    # Visible coins keep priority. Features 0-31 retain exactly the same
+    # meaning as in the stable Task 2 model.
+    if not coins:
+        crate_direction, crate_distance = nearest_crate_bombing_path(
+            game_state
+        )
+
+        if crate_distance is not None:
+            features[26] = 1.0
+
+        if crate_direction is not None:
+            features[27 + crate_direction] = 1.0
+
+        if crate_distance not in (None, 0):
+            field = game_state["field"]
+            maximum_distance = field.shape[0] + field.shape[1]
+            features[31] = min(
+                crate_distance / maximum_distance,
+                1.0,
+            )
+
+        # New additive features compare the current bomb yield with the
+        # best safe bombing position no more than four movements away.
+        # They are disabled while bombs are active so escape remains the
+        # unambiguous immediate goal.
+        if not game_state.get("bombs", []):
+            (
+                best_direction,
+                best_distance,
+                best_crate_count,
+            ) = best_crate_bombing_path(game_state)
+
+            current_crate_count, _opponent_count = bomb_target_counts(
+                game_state
+            )
+
+            features[38] = min(
+                best_crate_count / 4.0,
+                1.0,
+            )
+
+            better_position_exists = (
+                best_distance is not None
+                and best_crate_count > current_crate_count
+            )
+
+            if better_position_exists:
+                features[32] = 1.0
+
+                if best_direction is not None:
+                    features[33 + best_direction] = 1.0
+
+                if best_distance not in (None, 0):
+                    field = game_state["field"]
+                    maximum_distance = (
+                        field.shape[0] + field.shape[1]
+                    )
+                    features[37] = min(
+                        best_distance / maximum_distance,
+                        1.0,
+                    )
+
     return features
 
 
 def nearest_coin_path(
     game_state: dict,
 ) -> tuple[int | None, int | None]:
-    """
-    Use breadth-first search to find the nearest reachable coin.
-
-    Returns:
-        direction_index:
-            0=UP, 1=RIGHT, 2=DOWN, 3=LEFT
-        distance:
-            length of the shortest path to that coin
-    """
+    """Use breadth-first search to find the nearest reachable coin."""
     field = game_state["field"]
     start = game_state["self"][3]
-    targets = set(game_state["coins"])
+    targets = set(game_state.get("coins", []))
 
     if not targets:
         return None, None
 
     blocked_positions = {
-        position for position, _timer in game_state["bombs"]
+        position
+        for position, _timer in game_state.get("bombs", [])
     }
     blocked_positions.update(
-        other_agent[3] for other_agent in game_state["others"]
+        other_agent[3]
+        for other_agent in game_state.get("others", [])
     )
 
-    # Each queue item contains:
-    # (position, first_direction_index, path_distance)
     queue = deque([(start, None, 0)])
     visited = {start}
 
