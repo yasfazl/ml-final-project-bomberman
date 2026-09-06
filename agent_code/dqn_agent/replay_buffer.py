@@ -43,10 +43,7 @@ class ReplayBuffer:
                 state=np.asarray(state, dtype=np.float32).copy(),
                 action=int(action),
                 reward=float(reward),
-                next_state=np.asarray(
-                    next_state,
-                    dtype=np.float32,
-                ).copy(),
+                next_state=np.asarray(next_state, dtype=np.float32).copy(),
                 next_action_mask=np.asarray(
                     next_action_mask,
                     dtype=bool,

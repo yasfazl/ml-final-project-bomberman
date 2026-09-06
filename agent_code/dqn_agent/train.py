@@ -1,4 +1,4 @@
-"""Replay-based Double DQN training for the warm-started Bomberman agent."""
+"""Adapter-only Double DQN training for opponent-aware endgames."""
 
 from __future__ import annotations
 
@@ -16,13 +16,17 @@ from ..q_learning_agent.train import (
     add_crate_navigation_event,
     add_escape_events,
     add_waiting_event,
-    reward_from_events,
+    reward_from_events as base_reward_from_events,
 )
 from .callbacks import (
     ACTIONS,
+    BASE_FEATURE_DIM,
     CHECKPOINT_VERSION,
+    ENDGAME_EPSILON_MIN,
     FEATURE_DIM,
     candidate_action_mask,
+    endgame_opponent_pursuit_active,
+    nearest_opponent_path,
     state_to_features,
 )
 from .replay_buffer import ReplayBuffer
@@ -38,14 +42,33 @@ GRADIENT_CLIP_NORM = 10.0
 EPSILON_MIN = 0.05
 EPSILON_DECAY = 0.995
 
+MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
+MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
+WAITED_DURING_ENDGAME = "WAITED_DURING_ENDGAME"
+
+REWARD_MOVED_TOWARD_OPPONENT = 0.5
+REWARD_MOVED_AWAY_FROM_OPPONENT = -0.5
+REWARD_WAITED_DURING_ENDGAME = -1.0
+
 
 def setup_training(self):
-    """Initialize replay memory and the optimizer."""
+    """Train only the opponent-feature adapter in the first input layer."""
     self.replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
-    self.optimizer = torch.optim.Adam(
-        self.policy_net.parameters(),
-        lr=LEARNING_RATE,
+
+    for parameter in self.policy_net.parameters():
+        parameter.requires_grad_(False)
+    adapter_weight = self.policy_net.network[0].weight
+    adapter_weight.requires_grad_(True)
+
+    def keep_only_endgame_feature_gradients(gradient):
+        masked_gradient = gradient.clone()
+        masked_gradient[:, :BASE_FEATURE_DIM] = 0.0
+        return masked_gradient
+
+    self.endgame_gradient_hook = adapter_weight.register_hook(
+        keep_only_endgame_feature_gradients
     )
+    self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
     if self.pending_optimizer_state is not None:
         try:
             self.optimizer.load_state_dict(self.pending_optimizer_state)
@@ -60,7 +83,60 @@ def setup_training(self):
     self.target_net.eval()
     self.logger.info(
         "Double DQN training initialized: "
-        f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}."
+        f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}, "
+        f"endgame_epsilon={self.endgame_epsilon:.3f}, "
+        "trainable=endgame_input_adapter."
+    )
+
+
+def add_endgame_opponent_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+) -> None:
+    """Reward only the progress caused by our movement toward an opponent."""
+    if old_game_state is None or new_game_state is None:
+        return
+    if not endgame_opponent_pursuit_active(old_game_state):
+        return
+
+    _old_direction, old_distance = nearest_opponent_path(old_game_state)
+    if old_distance is None:
+        return
+
+    comparison_state = dict(old_game_state)
+    comparison_agent = list(old_game_state["self"])
+    comparison_agent[3] = tuple(new_game_state["self"][3])
+    comparison_state["self"] = tuple(comparison_agent)
+    _new_direction, new_distance = nearest_opponent_path(comparison_state)
+    if new_distance is None:
+        return
+    if new_distance < old_distance:
+        events.append(MOVED_TOWARD_OPPONENT)
+    elif new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_OPPONENT)
+
+
+def add_endgame_waiting_event(
+    game_state: dict,
+    action: str,
+    events: List[str],
+) -> None:
+    if action == "WAIT" and endgame_opponent_pursuit_active(game_state):
+        events.append(WAITED_DURING_ENDGAME)
+
+
+def reward_from_events(self, events: List[str]) -> float:
+    """Add endgame shaping without modifying v2.2's reward function."""
+    reward = base_reward_from_events(self, events)
+    endgame_rewards = {
+        MOVED_TOWARD_OPPONENT: REWARD_MOVED_TOWARD_OPPONENT,
+        MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
+        WAITED_DURING_ENDGAME: REWARD_WAITED_DURING_ENDGAME,
+    }
+    return float(
+        reward
+        + sum(endgame_rewards.get(event, 0.0) for event in events)
     )
 
 
@@ -85,7 +161,6 @@ def _store_transition(
         next_mask = np.zeros(len(ACTIONS), dtype=bool)
     else:
         next_mask = candidate_action_mask(self, new_game_state)
-
     self.replay_buffer.add(
         state=_features_or_zeros(old_game_state),
         action=ACTIONS.index(action),
@@ -120,6 +195,12 @@ def game_events_occurred(
         new_game_state,
         events,
     )
+    add_endgame_opponent_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
+    add_endgame_waiting_event(old_game_state, self_action, events)
     reward = reward_from_events(self, events)
     _store_transition(
         self,
@@ -142,6 +223,7 @@ def end_of_round(
 ):
     """Store the terminal transition and save an atomic checkpoint."""
     add_bomb_placement_event(last_game_state, last_action, events)
+    add_endgame_waiting_event(last_game_state, last_action, events)
     reward = reward_from_events(self, events)
     _store_transition(
         self,
@@ -157,12 +239,14 @@ def end_of_round(
 
     self.episodes_trained += 1
     self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
+    self.endgame_epsilon = max(
+        ENDGAME_EPSILON_MIN,
+        self.endgame_epsilon * EPSILON_DECAY,
+    )
     save_checkpoint(self)
 
     mean_loss = (
-        float(np.mean(self.round_losses))
-        if self.round_losses
-        else 0.0
+        float(np.mean(self.round_losses)) if self.round_losses else 0.0
     )
     self.logger.info(
         f"DQN episode {self.episodes_trained}: "
@@ -189,8 +273,6 @@ def double_dqn_targets(
             ~next_action_masks,
             -torch.inf,
         )
-        # Terminal masks are intentionally empty.  Give them a temporary
-        # valid action so argmax remains defined; ``dones`` removes its value.
         empty_masks = ~next_action_masks.any(dim=1)
         if empty_masks.any():
             masked_policy_values[empty_masks, 0] = 0.0
@@ -256,11 +338,10 @@ def optimize_model(self) -> float | None:
         dones,
     )
     loss = nn.functional.smooth_l1_loss(current_values, targets)
-
     self.optimizer.zero_grad(set_to_none=True)
     loss.backward()
     nn.utils.clip_grad_norm_(
-        self.policy_net.parameters(),
+        [self.policy_net.network[0].weight],
         GRADIENT_CLIP_NORM,
     )
     self.optimizer.step()
@@ -289,7 +370,9 @@ def save_checkpoint(self) -> None:
         "environment_steps": int(self.environment_steps),
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
-        "algorithm": "warm_started_masked_double_dqn_v1",
+        "endgame_epsilon": float(self.endgame_epsilon),
+        "training_scope": "endgame_input_adapter_only",
+        "algorithm": "opponent_aware_masked_double_dqn_v2",
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")

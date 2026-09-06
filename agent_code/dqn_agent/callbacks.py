@@ -1,4 +1,4 @@
-"""Callbacks for a warm-started Double DQN Bomberman agent."""
+"""Callbacks for an opponent-aware warm-started Double DQN agent."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import torch
 
 from ..q_learning_agent.callbacks import (
     ACTIONS,
-    FEATURE_DIM,
+    FEATURE_DIM as BASE_FEATURE_DIM,
     _anti_stall_candidate_indices,
     _clear_inactive_own_bomb_memory,
     _crate_bomb_deferral_candidate_indices,
@@ -20,14 +20,20 @@ from ..q_learning_agent.callbacks import (
     _record_anti_stall_choice,
     _remember_own_bomb_if_selected,
     _time_expanded_candidate_indices,
-    state_to_features,
+    state_to_features as base_state_to_features,
     valid_action_indices,
 )
+from ..q_learning_agent.game_utils import DIRECTIONS, bomb_target_counts
 from .model import DQN, initialize_from_linear_q
 
 
 HIDDEN_DIM = 128
-CHECKPOINT_VERSION = 1
+ENDGAME_FEATURE_DIM = 6
+FEATURE_DIM = BASE_FEATURE_DIM + ENDGAME_FEATURE_DIM
+CHECKPOINT_VERSION = 2
+ENDGAME_EPSILON_START = 0.20
+ENDGAME_EPSILON_MIN = 0.05
+ENDGAME_WAIT_LIMIT = 2
 DQN_MODEL_PATH = Path(__file__).resolve().parent / "dqn_model.pt"
 LINEAR_TEACHER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -57,7 +63,6 @@ def _load_torch_checkpoint(path: Path, device: torch.device) -> dict:
     try:
         return torch.load(path, map_location=device, weights_only=True)
     except TypeError:
-        # Compatibility with PyTorch versions before ``weights_only``.
         return torch.load(path, map_location=device)
 
 
@@ -65,7 +70,7 @@ def _load_linear_teacher(path: Path) -> np.ndarray:
     with path.open("rb") as file:
         saved_data = pickle.load(file)
     weights = np.asarray(saved_data["weights"], dtype=np.float32)
-    expected = (len(ACTIONS), FEATURE_DIM)
+    expected = (len(ACTIONS), BASE_FEATURE_DIM)
     if weights.shape != expected:
         raise ValueError(
             f"Expected teacher weights with shape {expected}, "
@@ -76,17 +81,144 @@ def _load_linear_teacher(path: Path) -> np.ndarray:
     return weights
 
 
+def _migrate_network_state(state: dict, old_feature_dim: int) -> dict:
+    """Expand a v1 network input layer without changing its Q-values."""
+    if old_feature_dim == FEATURE_DIM:
+        return state
+    if old_feature_dim != BASE_FEATURE_DIM:
+        raise ValueError(
+            f"Cannot migrate DQN with {old_feature_dim} features."
+        )
+
+    migrated = {name: tensor.clone() for name, tensor in state.items()}
+    input_weight_name = "network.0.weight"
+    old_weight = migrated[input_weight_name]
+    expected_shape = (HIDDEN_DIM, old_feature_dim)
+    if tuple(old_weight.shape) != expected_shape:
+        raise ValueError(
+            f"Expected first-layer shape {expected_shape}, "
+            f"found {tuple(old_weight.shape)}."
+        )
+
+    expanded_weight = old_weight.new_zeros(HIDDEN_DIM, FEATURE_DIM)
+    expanded_weight[:, :old_feature_dim] = old_weight
+    migrated[input_weight_name] = expanded_weight
+    return migrated
+
+
+def nearest_opponent_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """Find the shortest walkable path to a tile beside an opponent."""
+    field = game_state["field"]
+    start = tuple(game_state["self"][3])
+    opponents = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+    if not opponents:
+        return None, None
+
+    if any(
+        abs(start[0] - opponent[0]) + abs(start[1] - opponent[1]) == 1
+        for opponent in opponents
+    ):
+        return None, 0
+
+    blocked = {
+        tuple(position)
+        for position, _timer in game_state.get("bombs", [])
+    }
+    blocked.update(opponents)
+    queue = [(start, None, 0)]
+    queue_index = 0
+    visited = {start}
+
+    while queue_index < len(queue):
+        position, first_direction, distance = queue[queue_index]
+        queue_index += 1
+
+        if any(
+            abs(position[0] - opponent[0])
+            + abs(position[1] - opponent[1])
+            == 1
+            for opponent in opponents
+        ):
+            return first_direction, distance
+
+        for direction_index, (dx, dy) in enumerate(DIRECTIONS):
+            next_position = (position[0] + dx, position[1] + dy)
+            if next_position in visited or next_position in blocked:
+                continue
+            if field[next_position] != 0:
+                continue
+
+            visited.add(next_position)
+            queue.append(
+                (
+                    next_position,
+                    direction_index
+                    if first_direction is None
+                    else first_direction,
+                    distance + 1,
+                )
+            )
+
+    return None, None
+
+
+def endgame_opponent_pursuit_active(game_state: dict | None) -> bool:
+    """Enable pursuit only on a safe board with no coin or crate goal."""
+    if game_state is None:
+        return False
+    if game_state.get("coins", []) or np.any(game_state["field"] == 1):
+        return False
+    if not game_state.get("others", []):
+        return False
+    if game_state.get("bombs", []):
+        return False
+
+    explosion_map = game_state.get("explosion_map")
+    if explosion_map is not None and np.any(np.asarray(explosion_map) > 0):
+        return False
+
+    _crate_count, opponent_count = bomb_target_counts(game_state)
+    if opponent_count > 0:
+        return False
+
+    direction, distance = nearest_opponent_path(game_state)
+    return direction is not None and distance not in (None, 0)
+
+
+def state_to_features(game_state: dict) -> np.ndarray | None:
+    """Append gated opponent-pursuit features to the stable v2.2 vector."""
+    base_features = base_state_to_features(game_state)
+    if base_features is None:
+        return None
+
+    features = np.zeros(FEATURE_DIM, dtype=np.float64)
+    features[:BASE_FEATURE_DIM] = base_features
+    if not endgame_opponent_pursuit_active(game_state):
+        return features
+
+    direction, distance = nearest_opponent_path(game_state)
+    features[39] = 1.0
+    if direction is not None:
+        features[40 + direction] = 1.0
+    if distance not in (None, 0):
+        field = game_state["field"]
+        maximum_distance = field.shape[0] + field.shape[1]
+        features[44] = min(distance / maximum_distance, 1.0)
+    return features
+
+
 def setup(self):
-    """Load a DQN checkpoint or exactly warm-start from the v2.2 model."""
+    """Load v2, migrate v1, or warm-start from the linear v2.2 model."""
     self.dqn_model_path = DQN_MODEL_PATH
     self.linear_teacher_path = LINEAR_TEACHER_PATH
     self.device = _select_device(self.logger)
-    self.policy_net = DQN(FEATURE_DIM, len(ACTIONS), HIDDEN_DIM).to(
-        self.device
-    )
-    self.target_net = DQN(FEATURE_DIM, len(ACTIONS), HIDDEN_DIM).to(
-        self.device
-    )
+    self.policy_net = DQN(FEATURE_DIM, len(ACTIONS), HIDDEN_DIM).to(self.device)
+    self.target_net = DQN(FEATURE_DIM, len(ACTIONS), HIDDEN_DIM).to(self.device)
 
     self.epsilon = 0.20
     self.episodes_trained = 0
@@ -94,11 +226,14 @@ def setup(self):
     self.optimizer_steps = 0
     self.warm_started = False
     self.pending_optimizer_state = None
+    self.feature_migrated = False
+    self.endgame_epsilon = ENDGAME_EPSILON_START
 
     self.last_own_bomb_position = None
     self.last_seen_round = None
     self.consecutive_safe_waits = 0
     self.last_wait_position = None
+    self.recent_positions = []
 
     loaded_checkpoint = False
     if self.dqn_model_path.is_file():
@@ -107,15 +242,25 @@ def setup(self):
                 self.dqn_model_path,
                 self.device,
             )
-            if int(checkpoint["checkpoint_version"]) != CHECKPOINT_VERSION:
+            checkpoint_version = int(checkpoint["checkpoint_version"])
+            if checkpoint_version not in {1, CHECKPOINT_VERSION}:
                 raise ValueError("Unsupported DQN checkpoint version.")
-            if int(checkpoint["feature_dim"]) != FEATURE_DIM:
+            saved_feature_dim = int(checkpoint["feature_dim"])
+            if saved_feature_dim not in {BASE_FEATURE_DIM, FEATURE_DIM}:
                 raise ValueError("DQN checkpoint feature dimension mismatch.")
             if list(checkpoint["actions"]) != ACTIONS:
                 raise ValueError("DQN checkpoint action order mismatch.")
 
-            self.policy_net.load_state_dict(checkpoint["policy_state"])
-            self.target_net.load_state_dict(checkpoint["target_state"])
+            policy_state = _migrate_network_state(
+                checkpoint["policy_state"],
+                saved_feature_dim,
+            )
+            target_state = _migrate_network_state(
+                checkpoint["target_state"],
+                saved_feature_dim,
+            )
+            self.policy_net.load_state_dict(policy_state)
+            self.target_net.load_state_dict(target_state)
             self.epsilon = float(checkpoint.get("epsilon", 0.20))
             self.episodes_trained = int(
                 checkpoint.get("episodes_trained", 0)
@@ -126,17 +271,27 @@ def setup(self):
             self.optimizer_steps = int(
                 checkpoint.get("optimizer_steps", 0)
             )
-            self.warm_started = bool(
-                checkpoint.get("warm_started", False)
+            self.warm_started = bool(checkpoint.get("warm_started", False))
+            self.feature_migrated = saved_feature_dim != FEATURE_DIM
+            self.endgame_epsilon = float(
+                checkpoint.get("endgame_epsilon", ENDGAME_EPSILON_START)
             )
-            self.pending_optimizer_state = checkpoint.get(
-                "optimizer_state"
-            )
+            if self.feature_migrated:
+                self.pending_optimizer_state = None
+            else:
+                self.pending_optimizer_state = checkpoint.get(
+                    "optimizer_state"
+                )
             loaded_checkpoint = True
             self.logger.info(
                 "Loaded DQN checkpoint after "
                 f"{self.episodes_trained} episodes."
             )
+            if self.feature_migrated:
+                self.logger.info(
+                    "Migrated DQN input from 39 to 45 features; "
+                    "existing Q-values are unchanged."
+                )
         except (OSError, KeyError, RuntimeError, TypeError, ValueError) as error:
             self.logger.warning(
                 f"Could not load DQN checkpoint: {error}. "
@@ -145,14 +300,17 @@ def setup(self):
 
     if not loaded_checkpoint:
         try:
-            teacher_weights = _load_linear_teacher(
-                self.linear_teacher_path
+            teacher_weights = _load_linear_teacher(self.linear_teacher_path)
+            expanded_teacher = np.zeros(
+                (len(ACTIONS), FEATURE_DIM),
+                dtype=np.float32,
             )
-            initialize_from_linear_q(self.policy_net, teacher_weights)
+            expanded_teacher[:, :BASE_FEATURE_DIM] = teacher_weights
+            initialize_from_linear_q(self.policy_net, expanded_teacher)
             self.warm_started = True
             self.logger.info(
-                "Warm-started DQN exactly from the stable 39-feature "
-                "Q-learning model."
+                "Warm-started the 45-feature DQN exactly from the stable "
+                "39-feature Q-learning model."
             )
         except (
             OSError,
@@ -172,32 +330,91 @@ def setup(self):
     self.target_net.eval()
 
 
+def _movement_destination(
+    game_state: dict,
+    action_index: int,
+) -> tuple[int, int] | None:
+    if action_index >= 4:
+        return None
+    position = tuple(game_state["self"][3])
+    dx, dy = DIRECTIONS[action_index]
+    return position[0] + dx, position[1] + dy
+
+
+def _endgame_cycle_candidate_indices(
+    self,
+    game_state: dict,
+    candidate_indices: list[int],
+) -> list[int]:
+    """Reject the next repeated A-B-A-B step when pursuit can progress."""
+    if not endgame_opponent_pursuit_active(game_state):
+        return candidate_indices
+
+    direction, _distance = nearest_opponent_path(game_state)
+    if direction not in candidate_indices:
+        return candidate_indices
+
+    wait_index = ACTIONS.index("WAIT")
+    filtered = list(candidate_indices)
+    if (
+        wait_index in filtered
+        and getattr(self, "consecutive_safe_waits", 0)
+        >= ENDGAME_WAIT_LIMIT
+    ):
+        filtered.remove(wait_index)
+
+    history = getattr(self, "recent_positions", [])
+    current_position = tuple(game_state["self"][3])
+    if len(history) >= 2 and current_position == history[-2]:
+        previous_position = history[-1]
+        returning_indices = {
+            action_index
+            for action_index in filtered
+            if _movement_destination(game_state, action_index)
+            == previous_position
+        }
+        if direction not in returning_indices:
+            without_return = [
+                action_index
+                for action_index in filtered
+                if action_index not in returning_indices
+            ]
+            if direction in without_return:
+                filtered = without_return
+
+    return filtered or candidate_indices
+
+
+def _record_endgame_position(self, game_state: dict) -> None:
+    history = list(getattr(self, "recent_positions", []))
+    history.append(tuple(game_state["self"][3]))
+    self.recent_positions = history[-4:]
+
+
 def candidate_action_indices(self, game_state: dict) -> list[int]:
-    """Apply the exact v2.2 safety and efficiency candidate filters."""
+    """Apply v2.2 safety filters plus the endgame cycle guard."""
     current_round = game_state.get("round")
     if getattr(self, "last_seen_round", None) != current_round:
         self.last_seen_round = current_round
         self.last_own_bomb_position = None
         self.consecutive_safe_waits = 0
         self.last_wait_position = None
+        self.recent_positions = []
 
     _clear_inactive_own_bomb_memory(self, game_state)
     candidates = valid_action_indices(game_state)
     candidates = _time_expanded_candidate_indices(game_state, candidates)
-    candidates = _post_bomb_candidate_indices(
-        self,
-        game_state,
-        candidates,
-    )
+    candidates = _post_bomb_candidate_indices(self, game_state, candidates)
     candidates = _crate_bomb_deferral_candidate_indices(
         game_state,
         candidates,
     )
-    return _anti_stall_candidate_indices(
+    candidates = _anti_stall_candidate_indices(
         self,
         game_state,
         candidates,
     )
+    return _endgame_cycle_candidate_indices(self, game_state, candidates)
 
 
 def candidate_action_mask(self, game_state: dict) -> np.ndarray:
@@ -207,14 +424,19 @@ def candidate_action_mask(self, game_state: dict) -> np.ndarray:
 
 
 def act(self, game_state: dict) -> str:
-    """Choose an epsilon-greedy action among v2.2-approved candidates."""
+    """Choose an epsilon-greedy action among approved candidates."""
     if game_state is None:
         return "WAIT"
 
     features = state_to_features(game_state)
     candidates = candidate_action_indices(self, game_state)
+    exploration_rate = (
+        self.endgame_epsilon
+        if endgame_opponent_pursuit_active(game_state)
+        else self.epsilon
+    )
 
-    if self.train and random.random() < self.epsilon:
+    if self.train and random.random() < exploration_rate:
         action_index = random.choice(candidates)
     else:
         feature_tensor = torch.as_tensor(
@@ -241,8 +463,9 @@ def act(self, game_state: dict) -> str:
     chosen_action = ACTIONS[action_index]
     _remember_own_bomb_if_selected(self, chosen_action, game_state)
     _record_anti_stall_choice(self, chosen_action, game_state)
+    _record_endgame_position(self, game_state)
     self.logger.debug(
-        f"DQN selected {chosen_action} with epsilon={self.epsilon:.3f}."
+        f"DQN selected {chosen_action} with epsilon={exploration_rate:.3f}."
     )
     return chosen_action
 

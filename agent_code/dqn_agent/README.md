@@ -1,54 +1,40 @@
-# Warm-started Double DQN agent
+# Opponent-aware warm-started Double DQN agent
 
-This agent is separate from `q_learning_agent`. It reuses the selected v2.2
-39-feature representation, safety shield, anti-stall guard, post-bomb escape,
-and conservative crate-bomb deferral.
+This agent is separate from `q_learning_agent`. It preserves the selected
+v2.2 39-feature representation and every existing safety filter. Six gated
+endgame inputs extend the network to 45 dimensions: pursuit-active, four path
+directions, and normalized opponent distance.
 
-On its first run, when `dqn_model.pt` is absent, the neural network is
-initialized so that its Q-values exactly equal the selected linear
-`q_model.pkl`. The initial DQN policy is therefore the proven v2.2 policy,
-not a random policy.
+A version-1 39-feature DQN checkpoint is migrated automatically by adding six
+zero input columns. Its existing Q-values therefore remain unchanged. When no
+DQN checkpoint exists, the network is exactly warm-started from the selected
+linear `q_model.pkl`.
 
-## Install PyTorch
+Only the six new first-layer input connections are trainable. These inputs are
+zero outside safe endgame pursuit, so training cannot alter coin, crate, or
+bomb-escape Q-values. Endgame exploration has a separate epsilon, and a small
+position-history guard breaks repeated A-B-A-B movement when a safe pursuit
+move is available.
 
-From the repository root, using the existing environment:
+Install PyTorch with the project environment:
 
 ```bash
 ~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python -m ensurepip --upgrade
 ~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python -m pip install -r requirements-dqn.txt
 ```
 
-## Verify the warm start visually (no training)
-
-```bash
-~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python main.py play \
-  --agents dqn_agent rule_based_agent rule_based_agent rule_based_agent \
-  --scenario classic \
-  --seed 42 \
-  --n-rounds 3 \
-  --update-interval 0.15
-```
-
-## First training stage
-
-Do not remove or overwrite `q_learning_agent/q_model.pkl`. Train the separate
-DQN for 1,000 classic rounds:
+Focused endgame training:
 
 ```bash
 ~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python main.py play \
   --agents dqn_agent rule_based_agent rule_based_agent rule_based_agent \
   --train 1 \
-  --scenario classic \
+  --scenario empty \
   --seed 123 \
-  --n-rounds 1000 \
+  --n-rounds 300 \
   --no-gui
 ```
 
 The learned checkpoint is saved only as
-`agent_code/dqn_agent/dqn_model.pt`. Evaluation commands must omit
-`--train 1`.
-
-The default device is CPU because this network is small. To request Apple
-Metal explicitly, set `BOMBERMAN_DQN_DEVICE=mps`; the code safely falls back
-to CPU when MPS is unavailable.
+`agent_code/dqn_agent/dqn_model.pt`. Evaluation must omit `--train 1`.
 

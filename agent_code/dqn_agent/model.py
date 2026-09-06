@@ -10,17 +10,11 @@ from torch import nn
 class DQN(nn.Module):
     """A small multilayer perceptron mapping features to action values."""
 
-    def __init__(
-        self,
-        feature_dim: int,
-        action_count: int,
-        hidden_dim: int = 128,
-    ):
+    def __init__(self, feature_dim: int, action_count: int, hidden_dim: int = 128):
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.action_count = int(action_count)
         self.hidden_dim = int(hidden_dim)
-
         self.network = nn.Sequential(
             nn.Linear(self.feature_dim, self.hidden_dim),
             nn.ReLU(),
@@ -37,14 +31,7 @@ def initialize_from_linear_q(
     model: DQN,
     linear_weights: np.ndarray | torch.Tensor,
 ) -> None:
-    """Make ``model(x)`` exactly equal the supplied linear Q-function.
-
-    A ReLU network can preserve a signed feature ``x`` by representing it as
-    ``relu(x) - relu(-x)``.  The first two hidden layers carry those positive
-    and negative parts, and the output layer reconstructs the original
-    linear action values.  Unused neurons start at zero and remain available
-    for later nonlinear learning.
-    """
+    """Make ``model(x)`` exactly equal the supplied linear Q-function."""
     weights = torch.as_tensor(linear_weights, dtype=torch.float32)
     expected_shape = (model.action_count, model.feature_dim)
     if tuple(weights.shape) != expected_shape:
@@ -63,7 +50,6 @@ def initialize_from_linear_q(
     first = model.network[0]
     second = model.network[2]
     output = model.network[4]
-
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.zero_()
@@ -77,10 +63,6 @@ def initialize_from_linear_q(
 
         preserved_indices = torch.arange(required_hidden)
         second.weight[preserved_indices, preserved_indices] = 1.0
-
         output.weight[:, :model.feature_dim] = weights
-        output.weight[
-            :,
-            model.feature_dim:required_hidden,
-        ] = -weights
+        output.weight[:, model.feature_dim:required_hidden] = -weights
 
