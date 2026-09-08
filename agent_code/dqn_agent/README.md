@@ -20,6 +20,13 @@ no bomb or explosion danger, a bomb is available, and an opponent is already
 in the current blast line. The adapter then learns whether to bomb now or move
 toward the nearest opponent-targeting tile with a robust escape route.
 
+V4 keeps that representation and policy intact but trains with five-step
+returns. A transition can therefore receive discounted credit from a kill or
+suicide observed up to four subsequent actions later. Terminal rounds flush
+all shorter remaining returns, and masked Double DQN bootstrapping uses
+`gamma ** actual_horizon`. Starting V4 from a V3 checkpoint resets stale V3
+optimizer momentum; resuming a V4 checkpoint restores its optimizer normally.
+
 This is a learned residual behavior, not a deterministic action override.
 Coin, crate, danger, and ordinary pursuit decisions are exactly version 2
 before and after adapter training because the new inputs are zero there.

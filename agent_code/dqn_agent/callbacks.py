@@ -365,6 +365,8 @@ def setup(self):
     self.pending_optimizer_state = None
     self.feature_migrated = False
     self.endgame_epsilon = ENDGAME_EPSILON_START
+    self.loaded_algorithm = None
+    self.loaded_n_step_return = 1
 
     self.last_own_bomb_position = None
     self.last_seen_round = None
@@ -416,6 +418,10 @@ def setup(self):
             self.feature_migrated = saved_feature_dim != FEATURE_DIM
             self.endgame_epsilon = float(
                 checkpoint.get("endgame_epsilon", ENDGAME_EPSILON_START)
+            )
+            self.loaded_algorithm = checkpoint.get("algorithm")
+            self.loaded_n_step_return = int(
+                checkpoint.get("n_step_return", 1)
             )
             if self.feature_migrated:
                 self.pending_optimizer_state = None

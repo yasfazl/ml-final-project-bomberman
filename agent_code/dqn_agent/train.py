@@ -32,7 +32,7 @@ from .callbacks import (
     safe_opponent_bombing_path,
     state_to_features,
 )
-from .replay_buffer import ReplayBuffer
+from .replay_buffer import NStepAccumulator, ReplayBuffer
 
 
 GAMMA = 0.90
@@ -44,6 +44,9 @@ TARGET_SYNC_INTERVAL = 1_000
 GRADIENT_CLIP_NORM = 10.0
 EPSILON_MIN = 0.05
 EPSILON_DECAY = 0.995
+N_STEP_RETURN = 5
+ALGORITHM = "safe_attack_masked_n_step_double_dqn_v4"
+TRAINING_SCOPE = "safe_attack_input_adapter_only_n_step"
 
 MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
 MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
@@ -65,8 +68,11 @@ REWARD_WAITED_DURING_SAFE_ATTACK = -1.0
 
 
 def setup_training(self):
-    """Train only the new safe-attack adapter input connections."""
+    """Train the safe-attack adapter with five-step Double DQN returns."""
     self.replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
+    n_step_return = int(getattr(self, "n_step_return", N_STEP_RETURN))
+    self.n_step_return = n_step_return
+    self.n_step_accumulator = NStepAccumulator(n_step_return, GAMMA)
 
     for parameter in self.policy_net.parameters():
         parameter.requires_grad_(False)
@@ -82,13 +88,22 @@ def setup_training(self):
         keep_only_safe_attack_feature_gradients
     )
     self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
-    if self.pending_optimizer_state is not None:
+    resume_v4_optimizer = (
+        getattr(self, "loaded_algorithm", None) == ALGORITHM
+        and int(getattr(self, "loaded_n_step_return", 1))
+        == n_step_return
+    )
+    if self.pending_optimizer_state is not None and resume_v4_optimizer:
         try:
             self.optimizer.load_state_dict(self.pending_optimizer_state)
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             self.logger.warning(
                 f"Could not restore optimizer state: {error}."
             )
+    elif self.pending_optimizer_state is not None:
+        self.logger.info(
+            "Reset optimizer state for the new n-step training stage."
+        )
     self.pending_optimizer_state = None
     self.round_reward = 0.0
     self.round_losses = []
@@ -98,6 +113,7 @@ def setup_training(self):
         "Double DQN training initialized: "
         f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}, "
         f"endgame_epsilon={self.endgame_epsilon:.3f}, "
+        f"n_step_return={self.n_step_return}, "
         "trainable=safe_attack_input_adapter."
     )
 
@@ -221,7 +237,7 @@ def _store_transition(
         next_mask = np.zeros(len(ACTIONS), dtype=bool)
     else:
         next_mask = candidate_action_mask(self, new_game_state)
-    self.replay_buffer.add(
+    ready_transitions = self.n_step_accumulator.append(
         state=_features_or_zeros(old_game_state),
         action=ACTIONS.index(action),
         reward=reward,
@@ -229,6 +245,16 @@ def _store_transition(
         next_action_mask=next_mask,
         done=done,
     )
+    for transition in ready_transitions:
+        self.replay_buffer.add(
+            state=transition.state,
+            action=transition.action,
+            reward=transition.reward,
+            next_state=transition.next_state,
+            next_action_mask=transition.next_action_mask,
+            done=transition.done,
+            n_steps=transition.n_steps,
+        )
     self.environment_steps += 1
 
 
@@ -335,6 +361,7 @@ def double_dqn_targets(
     next_states: torch.Tensor,
     next_action_masks: torch.Tensor,
     dones: torch.Tensor,
+    n_steps: torch.Tensor | None = None,
     gamma: float = GAMMA,
 ) -> torch.Tensor:
     """Compute masked Double DQN targets without tracking gradients."""
@@ -352,7 +379,14 @@ def double_dqn_targets(
             1,
             selected_actions,
         ).squeeze(1)
-        return rewards + gamma * (~dones).float() * target_values
+        if n_steps is None:
+            discounts = torch.full_like(rewards, float(gamma))
+        else:
+            discounts = torch.pow(
+                torch.full_like(rewards, float(gamma)),
+                n_steps.to(device=rewards.device, dtype=rewards.dtype),
+            )
+        return rewards + discounts * (~dones).float() * target_values
 
 
 def optimize_model(self) -> float | None:
@@ -394,6 +428,11 @@ def optimize_model(self) -> float | None:
         dtype=torch.bool,
         device=device,
     )
+    n_steps = torch.as_tensor(
+        [item.n_steps for item in transitions],
+        dtype=torch.long,
+        device=device,
+    )
 
     self.policy_net.train()
     current_values = self.policy_net(states).gather(
@@ -407,6 +446,7 @@ def optimize_model(self) -> float | None:
         next_states,
         next_masks,
         dones,
+        n_steps=n_steps,
     )
     loss = nn.functional.smooth_l1_loss(current_values, targets)
     self.optimizer.zero_grad(set_to_none=True)
@@ -442,8 +482,9 @@ def save_checkpoint(self) -> None:
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
         "endgame_epsilon": float(self.endgame_epsilon),
-        "training_scope": "safe_attack_input_adapter_only",
-        "algorithm": "safe_attack_staging_masked_double_dqn_v3",
+        "n_step_return": int(self.n_step_return),
+        "training_scope": TRAINING_SCOPE,
+        "algorithm": ALGORITHM,
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")

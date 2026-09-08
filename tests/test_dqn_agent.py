@@ -485,6 +485,14 @@ def test_checkpoint_round_trip(tmp_path, monkeypatch):
     first.endgame_epsilon = 0.12
     dqn_train.save_checkpoint(first)
 
+    saved = dqn_callbacks._load_torch_checkpoint(
+        checkpoint_path,
+        torch.device("cpu"),
+    )
+    assert saved["algorithm"] == dqn_train.ALGORITHM
+    assert saved["training_scope"] == dqn_train.TRAINING_SCOPE
+    assert saved["n_step_return"] == 5
+
     second = bare_agent()
     dqn_callbacks.setup(second)
     assert second.episodes_trained == 23
@@ -492,3 +500,5 @@ def test_checkpoint_round_trip(tmp_path, monkeypatch):
     assert second.optimizer_steps == 78
     assert second.endgame_epsilon == 0.12
     assert second.pending_optimizer_state is not None
+    assert second.loaded_algorithm == dqn_train.ALGORITHM
+    assert second.loaded_n_step_return == 5
