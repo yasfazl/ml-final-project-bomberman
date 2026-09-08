@@ -23,14 +23,20 @@ from ..q_learning_agent.callbacks import (
     state_to_features as base_state_to_features,
     valid_action_indices,
 )
-from ..q_learning_agent.game_utils import DIRECTIONS, bomb_target_counts
+from ..q_learning_agent.game_utils import (
+    DIRECTIONS,
+    bomb_has_robust_escape_route,
+    bomb_target_counts,
+)
 from .model import DQN, initialize_from_linear_q
 
 
 HIDDEN_DIM = 128
 ENDGAME_FEATURE_DIM = 6
-FEATURE_DIM = BASE_FEATURE_DIM + ENDGAME_FEATURE_DIM
-CHECKPOINT_VERSION = 2
+PREVIOUS_FEATURE_DIM = BASE_FEATURE_DIM + ENDGAME_FEATURE_DIM
+SAFE_ATTACK_FEATURE_DIM = 7
+FEATURE_DIM = PREVIOUS_FEATURE_DIM + SAFE_ATTACK_FEATURE_DIM
+CHECKPOINT_VERSION = 3
 ENDGAME_EPSILON_START = 0.20
 ENDGAME_EPSILON_MIN = 0.05
 ENDGAME_WAIT_LIMIT = 2
@@ -82,10 +88,10 @@ def _load_linear_teacher(path: Path) -> np.ndarray:
 
 
 def _migrate_network_state(state: dict, old_feature_dim: int) -> dict:
-    """Expand a v1 network input layer without changing its Q-values."""
+    """Expand a v1/v2 input layer without changing its Q-values."""
     if old_feature_dim == FEATURE_DIM:
         return state
-    if old_feature_dim != BASE_FEATURE_DIM:
+    if old_feature_dim not in {BASE_FEATURE_DIM, PREVIOUS_FEATURE_DIM}:
         raise ValueError(
             f"Cannot migrate DQN with {old_feature_dim} features."
         )
@@ -111,6 +117,7 @@ def nearest_opponent_path(
 ) -> tuple[int | None, int | None]:
     """Find the shortest walkable path to a tile beside an opponent."""
     field = game_state["field"]
+    width, height = field.shape
     start = tuple(game_state["self"][3])
     opponents = {
         tuple(opponent[3])
@@ -148,6 +155,11 @@ def nearest_opponent_path(
 
         for direction_index, (dx, dy) in enumerate(DIRECTIONS):
             next_position = (position[0] + dx, position[1] + dy)
+            if not (
+                0 <= next_position[0] < width
+                and 0 <= next_position[1] < height
+            ):
+                continue
             if next_position in visited or next_position in blocked:
                 continue
             if field[next_position] != 0:
@@ -190,30 +202,155 @@ def endgame_opponent_pursuit_active(game_state: dict | None) -> bool:
     return direction is not None and distance not in (None, 0)
 
 
+def _safe_endgame_board(game_state: dict | None) -> bool:
+    """Return whether attack planning cannot affect normal objectives."""
+    if game_state is None:
+        return False
+    if game_state.get("coins", []) or np.any(game_state["field"] == 1):
+        return False
+    if not game_state.get("others", []):
+        return False
+    if game_state.get("bombs", []):
+        return False
+    explosion_map = game_state.get("explosion_map")
+    return not (
+        explosion_map is not None
+        and np.any(np.asarray(explosion_map) > 0)
+    )
+
+
+def _state_with_agent_position(
+    game_state: dict,
+    position: tuple[int, int],
+) -> dict:
+    simulated_state = dict(game_state)
+    agent = list(game_state["self"])
+    agent[3] = position
+    simulated_state["self"] = tuple(agent)
+    return simulated_state
+
+
+def safe_opponent_bombing_path(
+    game_state: dict | None,
+) -> tuple[int | None, int | None, bool]:
+    """Find a safe attack tile when the current direct bomb is unsafe.
+
+    The mode is intentionally narrower than ordinary opponent pursuit: it is
+    considered only after all coins and crates are gone and an opponent is
+    already in the current blast line.  The returned boolean says that a
+    robust opponent-targeting bomb can be placed on the current tile.
+    """
+    if not _safe_endgame_board(game_state):
+        return None, None, False
+    if not bool(game_state["self"][2]):
+        return None, None, False
+
+    _crate_count, opponent_count = bomb_target_counts(game_state)
+    if opponent_count == 0:
+        return None, None, False
+    if bomb_has_robust_escape_route(game_state):
+        return None, 0, True
+
+    field = game_state["field"]
+    width, height = field.shape
+    start = tuple(game_state["self"][3])
+    opponents = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+    queue = [(start, None, 0)]
+    queue_index = 0
+    visited = {start}
+
+    while queue_index < len(queue):
+        position, first_direction, distance = queue[queue_index]
+        queue_index += 1
+
+        if distance > 0:
+            simulated_state = _state_with_agent_position(
+                game_state,
+                position,
+            )
+            _crates, simulated_opponents = bomb_target_counts(
+                simulated_state
+            )
+            if (
+                simulated_opponents > 0
+                and bomb_has_robust_escape_route(simulated_state)
+            ):
+                return first_direction, distance, False
+
+        for direction_index, (dx, dy) in enumerate(DIRECTIONS):
+            next_position = (position[0] + dx, position[1] + dy)
+            if not (
+                0 <= next_position[0] < width
+                and 0 <= next_position[1] < height
+            ):
+                continue
+            if next_position in visited or next_position in opponents:
+                continue
+            if field[next_position] != 0:
+                continue
+            visited.add(next_position)
+            queue.append(
+                (
+                    next_position,
+                    direction_index
+                    if first_direction is None
+                    else first_direction,
+                    distance + 1,
+                )
+            )
+
+    return None, None, False
+
+
+def endgame_safe_attack_active(game_state: dict | None) -> bool:
+    """Return whether the safe-attack feature block is active."""
+    _direction, distance, safe_bomb_now = safe_opponent_bombing_path(
+        game_state
+    )
+    return safe_bomb_now or distance not in (None, 0)
+
+
 def state_to_features(game_state: dict) -> np.ndarray | None:
-    """Append gated opponent-pursuit features to the stable v2.2 vector."""
+    """Append pursuit and safe-attack features to the stable vector."""
     base_features = base_state_to_features(game_state)
     if base_features is None:
         return None
 
     features = np.zeros(FEATURE_DIM, dtype=np.float64)
     features[:BASE_FEATURE_DIM] = base_features
-    if not endgame_opponent_pursuit_active(game_state):
-        return features
+    if endgame_opponent_pursuit_active(game_state):
+        direction, distance = nearest_opponent_path(game_state)
+        features[39] = 1.0
+        if direction is not None:
+            features[40 + direction] = 1.0
+        if distance not in (None, 0):
+            field = game_state["field"]
+            maximum_distance = field.shape[0] + field.shape[1]
+            features[44] = min(distance / maximum_distance, 1.0)
 
-    direction, distance = nearest_opponent_path(game_state)
-    features[39] = 1.0
-    if direction is not None:
-        features[40 + direction] = 1.0
-    if distance not in (None, 0):
+    attack_direction, attack_distance, safe_bomb_now = (
+        safe_opponent_bombing_path(game_state)
+    )
+    if safe_bomb_now or attack_distance not in (None, 0):
+        features[45] = 1.0
+        if attack_direction is not None:
+            features[46 + attack_direction] = 1.0
         field = game_state["field"]
         maximum_distance = field.shape[0] + field.shape[1]
-        features[44] = min(distance / maximum_distance, 1.0)
+        if attack_distance not in (None, 0):
+            features[50] = min(
+                attack_distance / maximum_distance,
+                1.0,
+            )
+        features[51] = float(safe_bomb_now)
     return features
 
 
 def setup(self):
-    """Load v2, migrate v1, or warm-start from the linear v2.2 model."""
+    """Load v3, migrate v1/v2, or warm-start from the linear model."""
     self.dqn_model_path = DQN_MODEL_PATH
     self.linear_teacher_path = LINEAR_TEACHER_PATH
     self.device = _select_device(self.logger)
@@ -243,10 +380,14 @@ def setup(self):
                 self.device,
             )
             checkpoint_version = int(checkpoint["checkpoint_version"])
-            if checkpoint_version not in {1, CHECKPOINT_VERSION}:
+            if checkpoint_version not in {1, 2, CHECKPOINT_VERSION}:
                 raise ValueError("Unsupported DQN checkpoint version.")
             saved_feature_dim = int(checkpoint["feature_dim"])
-            if saved_feature_dim not in {BASE_FEATURE_DIM, FEATURE_DIM}:
+            if saved_feature_dim not in {
+                BASE_FEATURE_DIM,
+                PREVIOUS_FEATURE_DIM,
+                FEATURE_DIM,
+            }:
                 raise ValueError("DQN checkpoint feature dimension mismatch.")
             if list(checkpoint["actions"]) != ACTIONS:
                 raise ValueError("DQN checkpoint action order mismatch.")
@@ -289,7 +430,8 @@ def setup(self):
             )
             if self.feature_migrated:
                 self.logger.info(
-                    "Migrated DQN input from 39 to 45 features; "
+                    f"Migrated DQN input from {saved_feature_dim} "
+                    f"to {FEATURE_DIM} features; "
                     "existing Q-values are unchanged."
                 )
         except (OSError, KeyError, RuntimeError, TypeError, ValueError) as error:
@@ -309,7 +451,8 @@ def setup(self):
             initialize_from_linear_q(self.policy_net, expanded_teacher)
             self.warm_started = True
             self.logger.info(
-                "Warm-started the 45-feature DQN exactly from the stable "
+                f"Warm-started the {FEATURE_DIM}-feature DQN exactly from "
+                "the stable "
                 "39-feature Q-learning model."
             )
         except (
@@ -430,10 +573,12 @@ def act(self, game_state: dict) -> str:
 
     features = state_to_features(game_state)
     candidates = candidate_action_indices(self, game_state)
+    endgame_adapter_active = (
+        endgame_opponent_pursuit_active(game_state)
+        or endgame_safe_attack_active(game_state)
+    )
     exploration_rate = (
-        self.endgame_epsilon
-        if endgame_opponent_pursuit_active(game_state)
-        else self.epsilon
+        self.endgame_epsilon if endgame_adapter_active else self.epsilon
     )
 
     if self.train and random.random() < exploration_rate:
@@ -468,4 +613,3 @@ def act(self, game_state: dict) -> str:
         f"DQN selected {chosen_action} with epsilon={exploration_rate:.3f}."
     )
     return chosen_action
-

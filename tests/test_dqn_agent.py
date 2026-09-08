@@ -17,6 +17,7 @@ from agent_code.q_learning_agent.callbacks import (
 
 
 DQN_FEATURE_DIM = dqn_callbacks.FEATURE_DIM
+PREVIOUS_FEATURE_DIM = dqn_callbacks.PREVIOUS_FEATURE_DIM
 
 
 class Logger:
@@ -153,11 +154,12 @@ def test_endgame_features_preserve_base_vector():
         features[:BASE_FEATURE_DIM],
         base_state_to_features(state),
     )
-    assert features.shape == (45,)
+    assert features.shape == (DQN_FEATURE_DIM,)
     assert features[39] == 1.0
     assert features[40] == 1.0
     assert features[41:44].sum() == 0.0
     assert features[44] == 3 / 22
+    assert not features[PREVIOUS_FEATURE_DIM:].any()
 
 
 def test_endgame_features_are_strictly_gated():
@@ -174,6 +176,14 @@ def test_endgame_features_are_strictly_gated():
     ]
     for state in states:
         assert not dqn_callbacks.state_to_features(state)[39:45].any()
+
+
+def test_safe_attack_features_do_not_change_old_endgame_features():
+    state = endgame_state(opponent_position=(5, 2))
+    features = dqn_callbacks.state_to_features(state)
+    assert not features[39:45].any()
+    assert features[45] == 1.0
+    assert features[51] == 1.0
 
 
 def test_endgame_cycle_guard_breaks_repeated_backtrack():
@@ -298,19 +308,21 @@ def test_adapter_update_cannot_change_normal_mode_outputs():
     agent.target_sync_interval = 100
 
     normal_states = torch.randn(5, DQN_FEATURE_DIM)
-    normal_states[:, BASE_FEATURE_DIM:] = 0.0
+    normal_states[:, PREVIOUS_FEATURE_DIM:] = 0.0
     with torch.no_grad():
         before = policy(normal_states).clone()
+    protected_before = policy.network[0].weight[
+        :, :PREVIOUS_FEATURE_DIM
+    ].detach().clone()
     adapter_before = policy.network[0].weight[
-        :,
-        BASE_FEATURE_DIM:,
+        :, PREVIOUS_FEATURE_DIM:
     ].detach().clone()
     for index in range(4):
         state = np.zeros(DQN_FEATURE_DIM, dtype=np.float32)
         state[0] = 1.0
-        state[39] = 1.0
-        state[40 + index] = 1.0
-        state[44] = 0.25
+        state[45] = 1.0
+        state[46 + index] = 1.0
+        state[50] = 0.25
         agent.replay_buffer.add(
             state,
             index,
@@ -323,8 +335,14 @@ def test_adapter_update_cannot_change_normal_mode_outputs():
     with torch.no_grad():
         after = policy(normal_states)
     torch.testing.assert_close(after, before, rtol=0, atol=0)
+    torch.testing.assert_close(
+        policy.network[0].weight[:, :PREVIOUS_FEATURE_DIM],
+        protected_before,
+        rtol=0,
+        atol=0,
+    )
     assert not torch.equal(
-        policy.network[0].weight[:, BASE_FEATURE_DIM:],
+        policy.network[0].weight[:, PREVIOUS_FEATURE_DIM:],
         adapter_before,
     )
 
@@ -361,7 +379,13 @@ def test_v1_checkpoint_migration_preserves_old_q_values(
         tmp_path / "missing.pkl",
     )
     features = torch.randn(12, BASE_FEATURE_DIM)
-    expanded = torch.cat([features, torch.randn(12, 6)], dim=1)
+    expanded = torch.cat(
+        [
+            features,
+            torch.randn(12, DQN_FEATURE_DIM - BASE_FEATURE_DIM),
+        ],
+        dim=1,
+    )
     with torch.no_grad():
         expected = old_policy(features)
     agent = bare_agent()
@@ -369,6 +393,71 @@ def test_v1_checkpoint_migration_preserves_old_q_values(
     with torch.no_grad():
         actual = agent.policy_net(expanded)
     torch.testing.assert_close(actual, expected)
+    assert agent.feature_migrated
+    assert agent.pending_optimizer_state is None
+
+
+def test_v2_checkpoint_migration_preserves_all_old_q_values(
+    tmp_path,
+    monkeypatch,
+):
+    torch.manual_seed(19)
+    old_policy = DQN(PREVIOUS_FEATURE_DIM, len(ACTIONS))
+    old_target = DQN(PREVIOUS_FEATURE_DIM, len(ACTIONS))
+    old_target.load_state_dict(old_policy.state_dict())
+    checkpoint_path = tmp_path / "dqn_model.pt"
+    torch.save(
+        {
+            "checkpoint_version": 2,
+            "feature_dim": PREVIOUS_FEATURE_DIM,
+            "actions": ACTIONS,
+            "policy_state": old_policy.state_dict(),
+            "target_state": old_target.state_dict(),
+            "optimizer_state": {"old": "incompatible"},
+            "epsilon": 0.05,
+            "episodes_trained": 300,
+            "environment_steps": 5000,
+            "optimizer_steps": 4000,
+            "warm_started": True,
+            "endgame_epsilon": 0.05,
+        },
+        checkpoint_path,
+    )
+    monkeypatch.setattr(dqn_callbacks, "DQN_MODEL_PATH", checkpoint_path)
+    monkeypatch.setattr(
+        dqn_callbacks,
+        "LINEAR_TEACHER_PATH",
+        tmp_path / "missing.pkl",
+    )
+    old_features = torch.randn(12, PREVIOUS_FEATURE_DIM)
+    expanded_features = torch.cat(
+        [
+            old_features,
+            torch.randn(
+                12,
+                DQN_FEATURE_DIM - PREVIOUS_FEATURE_DIM,
+            ),
+        ],
+        dim=1,
+    )
+    with torch.no_grad():
+        expected = old_policy(old_features)
+
+    agent = bare_agent()
+    dqn_callbacks.setup(agent)
+
+    with torch.no_grad():
+        actual = agent.policy_net(expanded_features)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        agent.policy_net.network[0].weight[
+            :, :PREVIOUS_FEATURE_DIM
+        ],
+        old_policy.network[0].weight,
+    )
+    assert not agent.policy_net.network[0].weight[
+        :, PREVIOUS_FEATURE_DIM:
+    ].count_nonzero()
     assert agent.feature_migrated
     assert agent.pending_optimizer_state is None
 
@@ -403,4 +492,3 @@ def test_checkpoint_round_trip(tmp_path, monkeypatch):
     assert second.optimizer_steps == 78
     assert second.endgame_epsilon == 0.12
     assert second.pending_optimizer_state is not None
-

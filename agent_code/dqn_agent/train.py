@@ -20,13 +20,16 @@ from ..q_learning_agent.train import (
 )
 from .callbacks import (
     ACTIONS,
-    BASE_FEATURE_DIM,
     CHECKPOINT_VERSION,
     ENDGAME_EPSILON_MIN,
     FEATURE_DIM,
+    PREVIOUS_FEATURE_DIM,
+    _state_with_agent_position,
     candidate_action_mask,
     endgame_opponent_pursuit_active,
+    endgame_safe_attack_active,
     nearest_opponent_path,
+    safe_opponent_bombing_path,
     state_to_features,
 )
 from .replay_buffer import ReplayBuffer
@@ -45,14 +48,24 @@ EPSILON_DECAY = 0.995
 MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
 MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
 WAITED_DURING_ENDGAME = "WAITED_DURING_ENDGAME"
+MOVED_TOWARD_SAFE_ATTACK_POSITION = (
+    "MOVED_TOWARD_SAFE_ATTACK_POSITION"
+)
+MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = (
+    "MOVED_AWAY_FROM_SAFE_ATTACK_POSITION"
+)
+WAITED_DURING_SAFE_ATTACK = "WAITED_DURING_SAFE_ATTACK"
 
 REWARD_MOVED_TOWARD_OPPONENT = 0.5
 REWARD_MOVED_AWAY_FROM_OPPONENT = -0.5
 REWARD_WAITED_DURING_ENDGAME = -1.0
+REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION = 0.5
+REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = -0.5
+REWARD_WAITED_DURING_SAFE_ATTACK = -1.0
 
 
 def setup_training(self):
-    """Train only the opponent-feature adapter in the first input layer."""
+    """Train only the new safe-attack adapter input connections."""
     self.replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
 
     for parameter in self.policy_net.parameters():
@@ -60,13 +73,13 @@ def setup_training(self):
     adapter_weight = self.policy_net.network[0].weight
     adapter_weight.requires_grad_(True)
 
-    def keep_only_endgame_feature_gradients(gradient):
+    def keep_only_safe_attack_feature_gradients(gradient):
         masked_gradient = gradient.clone()
-        masked_gradient[:, :BASE_FEATURE_DIM] = 0.0
+        masked_gradient[:, :PREVIOUS_FEATURE_DIM] = 0.0
         return masked_gradient
 
-    self.endgame_gradient_hook = adapter_weight.register_hook(
-        keep_only_endgame_feature_gradients
+    self.safe_attack_gradient_hook = adapter_weight.register_hook(
+        keep_only_safe_attack_feature_gradients
     )
     self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
     if self.pending_optimizer_state is not None:
@@ -85,7 +98,7 @@ def setup_training(self):
         "Double DQN training initialized: "
         f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}, "
         f"endgame_epsilon={self.endgame_epsilon:.3f}, "
-        "trainable=endgame_input_adapter."
+        "trainable=safe_attack_input_adapter."
     )
 
 
@@ -126,6 +139,46 @@ def add_endgame_waiting_event(
         events.append(WAITED_DURING_ENDGAME)
 
 
+def add_safe_attack_navigation_event(
+    old_game_state: dict,
+    new_game_state: dict,
+    events: List[str],
+) -> None:
+    """Shape progress toward a robust opponent-targeting bomb tile."""
+    if old_game_state is None or new_game_state is None:
+        return
+
+    _old_direction, old_distance, safe_bomb_now = (
+        safe_opponent_bombing_path(old_game_state)
+    )
+    if safe_bomb_now or old_distance in (None, 0):
+        return
+
+    comparison_state = _state_with_agent_position(
+        old_game_state,
+        tuple(new_game_state["self"][3]),
+    )
+    _new_direction, new_distance, new_safe_bomb_now = (
+        safe_opponent_bombing_path(comparison_state)
+    )
+    if new_safe_bomb_now or (
+        new_distance is not None and new_distance < old_distance
+    ):
+        events.append(MOVED_TOWARD_SAFE_ATTACK_POSITION)
+    elif new_distance is None or new_distance > old_distance:
+        events.append(MOVED_AWAY_FROM_SAFE_ATTACK_POSITION)
+
+
+def add_safe_attack_waiting_event(
+    game_state: dict,
+    action: str,
+    events: List[str],
+) -> None:
+    """Discourage stalling only while the safe-attack adapter is active."""
+    if action == "WAIT" and endgame_safe_attack_active(game_state):
+        events.append(WAITED_DURING_SAFE_ATTACK)
+
+
 def reward_from_events(self, events: List[str]) -> float:
     """Add endgame shaping without modifying v2.2's reward function."""
     reward = base_reward_from_events(self, events)
@@ -133,6 +186,13 @@ def reward_from_events(self, events: List[str]) -> float:
         MOVED_TOWARD_OPPONENT: REWARD_MOVED_TOWARD_OPPONENT,
         MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
         WAITED_DURING_ENDGAME: REWARD_WAITED_DURING_ENDGAME,
+        MOVED_TOWARD_SAFE_ATTACK_POSITION: (
+            REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION
+        ),
+        MOVED_AWAY_FROM_SAFE_ATTACK_POSITION: (
+            REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION
+        ),
+        WAITED_DURING_SAFE_ATTACK: REWARD_WAITED_DURING_SAFE_ATTACK,
     }
     return float(
         reward
@@ -201,6 +261,16 @@ def game_events_occurred(
         events,
     )
     add_endgame_waiting_event(old_game_state, self_action, events)
+    add_safe_attack_navigation_event(
+        old_game_state,
+        new_game_state,
+        events,
+    )
+    add_safe_attack_waiting_event(
+        old_game_state,
+        self_action,
+        events,
+    )
     reward = reward_from_events(self, events)
     _store_transition(
         self,
@@ -224,6 +294,7 @@ def end_of_round(
     """Store the terminal transition and save an atomic checkpoint."""
     add_bomb_placement_event(last_game_state, last_action, events)
     add_endgame_waiting_event(last_game_state, last_action, events)
+    add_safe_attack_waiting_event(last_game_state, last_action, events)
     reward = reward_from_events(self, events)
     _store_transition(
         self,
@@ -371,11 +442,10 @@ def save_checkpoint(self) -> None:
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
         "endgame_epsilon": float(self.endgame_epsilon),
-        "training_scope": "endgame_input_adapter_only",
-        "algorithm": "opponent_aware_masked_double_dqn_v2",
+        "training_scope": "safe_attack_input_adapter_only",
+        "algorithm": "safe_attack_staging_masked_double_dqn_v3",
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")
     torch.save(checkpoint, temporary_path)
     temporary_path.replace(model_path)
-
