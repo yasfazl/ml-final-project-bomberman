@@ -16,6 +16,7 @@ from ..q_learning_agent.callbacks import (
     _anti_stall_candidate_indices,
     _clear_inactive_own_bomb_memory,
     _crate_bomb_deferral_candidate_indices,
+    _current_position_has_known_danger,
     _post_bomb_candidate_indices,
     _record_anti_stall_choice,
     _remember_own_bomb_if_selected,
@@ -40,6 +41,11 @@ CHECKPOINT_VERSION = 3
 ENDGAME_EPSILON_START = 0.20
 ENDGAME_EPSILON_MIN = 0.05
 ENDGAME_WAIT_LIMIT = 2
+# A contested action is replaced in safe endgame play only when an
+# uncontested action is already close to the learned optimum.  This keeps the
+# guard from replacing clear tactical preferences merely to avoid a possible
+# simultaneous-movement collision.
+ENDGAME_CONFLICT_Q_RELATIVE_MARGIN = 0.05
 DQN_MODEL_PATH = Path(__file__).resolve().parent / "dqn_model.pt"
 LINEAR_TEACHER_PATH = (
     Path(__file__).resolve().parents[1]
@@ -484,6 +490,133 @@ def _movement_destination(
     return position[0] + dx, position[1] + dy
 
 
+def _contested_movement_indices(
+    game_state: dict,
+    candidate_indices: list[int],
+) -> set[int]:
+    """Return moves whose destination an opponent can enter this step.
+
+    All agents choose from the same state snapshot, but the engine executes
+    those choices in a random order.  Consequently, a currently free tile is
+    at risk of becoming occupied when it is one legal movement away from an
+    opponent.  This helper identifies that uncertainty without pretending to
+    know which action the opponent will actually select.
+    """
+    opponent_positions = {
+        tuple(opponent[3])
+        for opponent in game_state.get("others", [])
+    }
+    if not opponent_positions:
+        return set()
+
+    contested = set()
+    for action_index in candidate_indices:
+        destination = _movement_destination(game_state, action_index)
+        if destination is None:
+            continue
+        if any(
+            abs(destination[0] - opponent[0])
+            + abs(destination[1] - opponent[1])
+            == 1
+            for opponent in opponent_positions
+        ):
+            contested.add(action_index)
+    return contested
+
+
+def _danger_conflict_candidate_indices(
+    game_state: dict,
+    candidate_indices: list[int],
+) -> list[int]:
+    """Avoid a contested escape when another approved move is available.
+
+    This runs after the time-expanded survival filter.  It removes contested
+    movement only when at least one *other movement* has already passed every
+    existing safety check.  If the contested tile is the only escape move,
+    the original candidates are preserved rather than forcing WAIT.
+    """
+    if not _current_position_has_known_danger(game_state):
+        return candidate_indices
+
+    contested = _contested_movement_indices(
+        game_state,
+        candidate_indices,
+    )
+    if not contested:
+        return candidate_indices
+
+    uncontested_moves = [
+        action_index
+        for action_index in candidate_indices
+        if action_index < 4 and action_index not in contested
+    ]
+    if not uncontested_moves:
+        return candidate_indices
+
+    filtered = [
+        action_index
+        for action_index in candidate_indices
+        if action_index not in contested
+    ]
+    return filtered or candidate_indices
+
+
+def _soft_endgame_conflict_candidate_indices(
+    game_state: dict,
+    candidate_indices: list[int],
+    q_values: torch.Tensor,
+    relative_margin: float = ENDGAME_CONFLICT_Q_RELATIVE_MARGIN,
+) -> list[int]:
+    """Replace a contested best action only with a near-optimal alternative.
+
+    Normal coin and crate play is deliberately untouched.  On a safe
+    endgame board, a best movement action that may race an opponent is
+    replaced only if an uncontested action is within a small relative Q
+    margin.  Large learned preferences therefore remain authoritative.
+    """
+    if not candidate_indices:
+        return candidate_indices
+    if _current_position_has_known_danger(game_state):
+        return candidate_indices
+    if not (
+        endgame_opponent_pursuit_active(game_state)
+        or endgame_safe_attack_active(game_state)
+    ):
+        return candidate_indices
+
+    contested = _contested_movement_indices(
+        game_state,
+        candidate_indices,
+    )
+    if not contested:
+        return candidate_indices
+
+    candidate_values = {
+        action_index: float(q_values[action_index].item())
+        for action_index in candidate_indices
+    }
+    best_value = max(candidate_values.values())
+    best_indices = {
+        action_index
+        for action_index, value in candidate_values.items()
+        if np.isclose(value, best_value, rtol=1e-5, atol=1e-8)
+    }
+    if not best_indices.intersection(contested):
+        return candidate_indices
+
+    q_scale = max(1.0, abs(best_value))
+    maximum_gap = max(0.0, float(relative_margin)) * q_scale
+    uncontested_near_optimal = [
+        action_index
+        for action_index, value in candidate_values.items()
+        if (
+            action_index not in contested
+            and best_value - value <= maximum_gap
+        )
+    ]
+    return uncontested_near_optimal or candidate_indices
+
+
 def _endgame_cycle_candidate_indices(
     self,
     game_state: dict,
@@ -535,7 +668,7 @@ def _record_endgame_position(self, game_state: dict) -> None:
 
 
 def candidate_action_indices(self, game_state: dict) -> list[int]:
-    """Apply v2.2 safety filters plus the endgame cycle guard."""
+    """Apply established safety filters plus the conflict guards."""
     current_round = game_state.get("round")
     if getattr(self, "last_seen_round", None) != current_round:
         self.last_seen_round = current_round
@@ -557,7 +690,12 @@ def candidate_action_indices(self, game_state: dict) -> list[int]:
         game_state,
         candidates,
     )
-    return _endgame_cycle_candidate_indices(self, game_state, candidates)
+    candidates = _endgame_cycle_candidate_indices(
+        self,
+        game_state,
+        candidates,
+    )
+    return _danger_conflict_candidate_indices(game_state, candidates)
 
 
 def candidate_action_mask(self, game_state: dict) -> np.ndarray:
@@ -592,6 +730,11 @@ def act(self, game_state: dict) -> str:
         self.policy_net.eval()
         with torch.no_grad():
             q_values = self.policy_net(feature_tensor).squeeze(0)
+        candidates = _soft_endgame_conflict_candidate_indices(
+            game_state,
+            candidates,
+            q_values,
+        )
         masked = torch.full_like(q_values, -torch.inf)
         masked[candidates] = q_values[candidates]
         best_value = torch.max(masked)
