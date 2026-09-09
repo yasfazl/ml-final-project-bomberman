@@ -1,5 +1,11 @@
 # Safe-attack warm-started Double DQN agent
 
+The V5 experimental training path uses causal bomb-outcome reward
+redistribution. It removes the flat reward for merely targeting an opponent
+and assigns discounted owner-specific kill/self-kill outcomes to the original
+bomb action. Evaluation behavior and the network architecture are unchanged.
+See `DQN_CAUSAL_BOMB_REWARD_V5_README.md` at the repository root.
+
 This agent is separate from `q_learning_agent`. It preserves the selected
 v2.2 39-feature representation and every existing safety filter. Six gated
 endgame inputs extend the network to 45 dimensions: pursuit-active, four path

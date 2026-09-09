@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List
 
@@ -9,7 +10,13 @@ import numpy as np
 import torch
 from torch import nn
 
+import events as e
+
 from ..q_learning_agent.train import (
+    BOMB_TARGETED_OPPONENT,
+    REWARD_BOMB_TARGETED_OPPONENT,
+    REWARD_KILLED_OPPONENT,
+    REWARD_KILLED_SELF,
     add_bomb_placement_event,
     add_coin_distance_event,
     add_crate_efficiency_navigation_event,
@@ -44,6 +51,7 @@ TARGET_SYNC_INTERVAL = 1_000
 GRADIENT_CLIP_NORM = 10.0
 EPSILON_MIN = 0.05
 EPSILON_DECAY = 0.995
+ALGORITHM = "safe_attack_causal_bomb_reward_double_dqn_v5"
 
 MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
 MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
@@ -64,6 +72,20 @@ REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = -0.5
 REWARD_WAITED_DURING_SAFE_ATTACK = -1.0
 
 
+@dataclass(frozen=True)
+class StagedBombTransition:
+    """A bomb decision held until that bomb's outcome is observable."""
+
+    state: np.ndarray
+    action: int
+    reward: float
+    next_state: np.ndarray
+    next_action_mask: np.ndarray
+    done: bool
+    round_id: int
+    placed_step: int
+
+
 def setup_training(self):
     """Train only the new safe-attack adapter input connections."""
     self.replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
@@ -82,14 +104,33 @@ def setup_training(self):
         keep_only_safe_attack_feature_gradients
     )
     self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
-    if self.pending_optimizer_state is not None:
+    if (
+        self.pending_optimizer_state is not None
+        and getattr(self, "loaded_algorithm", None) == ALGORITHM
+    ):
         try:
             self.optimizer.load_state_dict(self.pending_optimizer_state)
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             self.logger.warning(
                 f"Could not restore optimizer state: {error}."
             )
+    elif self.pending_optimizer_state is not None:
+        self.logger.info(
+            "Starting causal-reward V5 with a fresh optimizer; "
+            "the loaded checkpoint belongs to an earlier algorithm."
+        )
     self.pending_optimizer_state = None
+    self.pending_bomb_transition = None
+    saved_stats = getattr(self, "loaded_bomb_outcome_stats", {})
+    self.bomb_outcome_stats = {
+        "resolved_bombs": int(saved_stats.get("resolved_bombs", 0)),
+        "opponents_killed": int(saved_stats.get("opponents_killed", 0)),
+        "self_kills": int(saved_stats.get("self_kills", 0)),
+        "misses": int(saved_stats.get("misses", 0)),
+        "terminal_unresolved": int(
+            saved_stats.get("terminal_unresolved", 0)
+        ),
+    }
     self.round_reward = 0.0
     self.round_losses = []
     self.policy_net.train()
@@ -206,6 +247,44 @@ def _features_or_zeros(game_state: dict | None) -> np.ndarray:
     return np.asarray(state_to_features(game_state), dtype=np.float32)
 
 
+def _make_staged_transition(
+    self,
+    old_game_state: dict,
+    action: str,
+    reward: float,
+    new_game_state: dict | None,
+) -> StagedBombTransition:
+    """Materialize a replay transition without appending it yet."""
+    done = new_game_state is None
+    if done:
+        next_mask = np.zeros(len(ACTIONS), dtype=bool)
+    else:
+        next_mask = candidate_action_mask(self, new_game_state)
+    return StagedBombTransition(
+        state=_features_or_zeros(old_game_state),
+        action=ACTIONS.index(action),
+        reward=float(reward),
+        next_state=_features_or_zeros(new_game_state),
+        next_action_mask=np.asarray(next_mask, dtype=bool),
+        done=done,
+        round_id=int(old_game_state.get("round", -1)),
+        placed_step=int(old_game_state.get("step", 0)),
+    )
+
+
+def _append_staged_transition(self, transition: StagedBombTransition) -> None:
+    """Append a fully valued staged transition to replay."""
+    self.replay_buffer.add(
+        state=transition.state,
+        action=transition.action,
+        reward=transition.reward,
+        next_state=transition.next_state,
+        next_action_mask=transition.next_action_mask,
+        done=transition.done,
+    )
+    self.environment_steps += 1
+
+
 def _store_transition(
     self,
     old_game_state: dict,
@@ -215,21 +294,146 @@ def _store_transition(
 ) -> None:
     if old_game_state is None or action not in ACTIONS:
         return
-
-    done = new_game_state is None
-    if done:
-        next_mask = np.zeros(len(ACTIONS), dtype=bool)
-    else:
-        next_mask = candidate_action_mask(self, new_game_state)
-    self.replay_buffer.add(
-        state=_features_or_zeros(old_game_state),
-        action=ACTIONS.index(action),
-        reward=reward,
-        next_state=_features_or_zeros(new_game_state),
-        next_action_mask=next_mask,
-        done=done,
+    _append_staged_transition(
+        self,
+        _make_staged_transition(
+            self,
+            old_game_state,
+            action,
+            reward,
+            new_game_state,
+        ),
     )
-    self.environment_steps += 1
+
+
+def _stage_bomb_transition(
+    self,
+    old_game_state: dict,
+    action: str,
+    reward: float,
+    new_game_state: dict | None,
+) -> None:
+    """Hold a successfully placed bomb until it explodes or the round ends."""
+    previous = getattr(self, "pending_bomb_transition", None)
+    if previous is not None:
+        self.logger.warning(
+            "Found an unresolved bomb while staging another; "
+            "committing the older transition without outcome credit."
+        )
+        _append_staged_transition(self, previous)
+    self.pending_bomb_transition = _make_staged_transition(
+        self,
+        old_game_state,
+        action,
+        reward,
+        new_game_state,
+    )
+
+
+def _resolve_pending_bomb(
+    self,
+    events: List[str],
+    current_game_state: dict | None,
+) -> tuple[float, float]:
+    """Move causal kill/self-kill reward onto the originating bomb action.
+
+    Returns the undiscounted outcome removed from the current transition and
+    the discounted amount added to the staged bomb transition.
+    """
+    pending = getattr(self, "pending_bomb_transition", None)
+    if pending is None or e.BOMB_EXPLODED not in events:
+        return 0.0, 0.0
+
+    kill_count = events.count(e.KILLED_OPPONENT)
+    self_kill_count = events.count(e.KILLED_SELF)
+    causal_outcome = (
+        kill_count * REWARD_KILLED_OPPONENT
+        + self_kill_count * REWARD_KILLED_SELF
+    )
+    current_step = (
+        int(current_game_state.get("step", pending.placed_step))
+        if current_game_state is not None
+        else pending.placed_step
+    )
+    delay = max(0, current_step - pending.placed_step)
+    redistributed = (GAMMA ** delay) * causal_outcome
+    _append_staged_transition(
+        self,
+        replace(pending, reward=pending.reward + redistributed),
+    )
+    self.pending_bomb_transition = None
+
+    stats = self.bomb_outcome_stats
+    stats["resolved_bombs"] += 1
+    stats["opponents_killed"] += kill_count
+    stats["self_kills"] += self_kill_count
+    if kill_count == 0 and self_kill_count == 0:
+        stats["misses"] += 1
+
+    self.logger.debug(
+        "Resolved staged bomb after "
+        f"{delay} steps: kills={kill_count}, self_kills={self_kill_count}, "
+        f"causal={causal_outcome:.3f}, "
+        f"redistributed={redistributed:.3f}."
+    )
+    return float(causal_outcome), float(redistributed)
+
+
+def _flush_pending_bomb(self) -> None:
+    """Commit a bomb whose outcome cannot be observed after round end."""
+    pending = getattr(self, "pending_bomb_transition", None)
+    if pending is None:
+        return
+    _append_staged_transition(self, pending)
+    self.pending_bomb_transition = None
+    self.bomb_outcome_stats["terminal_unresolved"] += 1
+
+
+def _record_causal_transition(
+    self,
+    old_game_state: dict,
+    action: str,
+    new_game_state: dict | None,
+    events: List[str],
+) -> float:
+    """Store one transition using causal outcome credit for placed bombs."""
+    reward = reward_from_events(self, events)
+    causal_outcome, redistributed = _resolve_pending_bomb(
+        self,
+        events,
+        old_game_state,
+    )
+    reward -= causal_outcome
+    reward_delta = reward + redistributed
+
+    successful_bomb = (
+        action == "BOMB"
+        and e.BOMB_DROPPED in events
+        and old_game_state is not None
+    )
+    if successful_bomb:
+        false_positive_bonus = (
+            events.count(BOMB_TARGETED_OPPONENT)
+            * REWARD_BOMB_TARGETED_OPPONENT
+        )
+        reward -= false_positive_bonus
+        reward_delta -= false_positive_bonus
+        _stage_bomb_transition(
+            self,
+            old_game_state,
+            action,
+            reward,
+            new_game_state,
+        )
+    else:
+        _store_transition(
+            self,
+            old_game_state,
+            action,
+            reward,
+            new_game_state,
+        )
+    return float(reward_delta)
 
 
 def game_events_occurred(
@@ -271,16 +475,15 @@ def game_events_occurred(
         self_action,
         events,
     )
-    reward = reward_from_events(self, events)
-    _store_transition(
+    reward_delta = _record_causal_transition(
         self,
         old_game_state,
         self_action,
-        reward,
         new_game_state,
+        events,
     )
     loss = optimize_model(self)
-    self.round_reward += reward
+    self.round_reward += reward_delta
     if loss is not None:
         self.round_losses.append(loss)
 
@@ -295,16 +498,16 @@ def end_of_round(
     add_bomb_placement_event(last_game_state, last_action, events)
     add_endgame_waiting_event(last_game_state, last_action, events)
     add_safe_attack_waiting_event(last_game_state, last_action, events)
-    reward = reward_from_events(self, events)
-    _store_transition(
+    reward_delta = _record_causal_transition(
         self,
         last_game_state,
         last_action,
-        reward,
         None,
+        events,
     )
+    _flush_pending_bomb(self)
     loss = optimize_model(self)
-    self.round_reward += reward
+    self.round_reward += reward_delta
     if loss is not None:
         self.round_losses.append(loss)
 
@@ -442,8 +645,16 @@ def save_checkpoint(self) -> None:
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
         "endgame_epsilon": float(self.endgame_epsilon),
-        "training_scope": "safe_attack_input_adapter_only",
-        "algorithm": "safe_attack_staging_masked_double_dqn_v3",
+        "training_scope": (
+            "safe_attack_input_adapter_only_causal_bomb_reward"
+        ),
+        "algorithm": ALGORITHM,
+        "bomb_reward_redistribution": {
+            "flat_target_bonus_removed": True,
+            "discount_factor": GAMMA,
+            "moved_events": [e.KILLED_OPPONENT, e.KILLED_SELF],
+        },
+        "bomb_outcome_stats": dict(self.bomb_outcome_stats),
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")
