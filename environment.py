@@ -15,8 +15,8 @@ import events as e
 import settings as s
 from agents import Agent, SequentialAgentBackend
 from fallbacks import pygame
+from invalid_action_diagnostics import record_invalid_action
 from items import Coin, Explosion, Bomb
-from suicide_diagnostics import DeathDiagnostics
 
 WorldArgs = namedtuple("WorldArgs",
                        ["no_gui", "fps", "turn_based", "update_interval", "save_replay", "replay", "make_video", "continue_without_training", "log_dir", "save_stats", "match_name", "seed", "silence_errors", "scenario"])
@@ -48,7 +48,6 @@ class GenericWorld:
     def __init__(self, args: WorldArgs):
         self.args = args
         self.setup_logging()
-        self.death_diagnostics = DeathDiagnostics.from_args(args)
 
         self.colors = list(s.AGENT_COLORS)
 
@@ -102,7 +101,6 @@ class GenericWorld:
         }
 
         self.round = new_round
-        self.death_diagnostics.start_round(new_round)
         self.running = True
 
     def build_arena(self) -> Tuple[np.array, List[Coin], List[Agent]]:
@@ -129,9 +127,6 @@ class GenericWorld:
         return is_free
 
     def perform_agent_action(self, agent: Agent, action: str):
-        previous_event_count = len(agent.events)
-        previous_position = (agent.x, agent.y)
-
         # Perform the specified action if possible, wait otherwise
         if action == 'UP' and self.tile_is_free(agent.x, agent.y - 1):
             agent.y -= 1
@@ -147,29 +142,14 @@ class GenericWorld:
             agent.add_event(e.MOVED_RIGHT)
         elif action == 'BOMB' and agent.bombs_left:
             self.logger.info(f'Agent <{agent.name}> drops bomb at {(agent.x, agent.y)}')
-            bomb = Bomb((agent.x, agent.y), agent, s.BOMB_TIMER, s.BOMB_POWER, agent.bomb_sprite)
-            bomb.diagnostic_placed_round = self.round
-            bomb.diagnostic_placed_step = self.step
-            self.bombs.append(bomb)
+            self.bombs.append(Bomb((agent.x, agent.y), agent, s.BOMB_TIMER, s.BOMB_POWER, agent.bomb_sprite))
             agent.bombs_left = False
             agent.add_event(e.BOMB_DROPPED)
         elif action == 'WAIT':
             agent.add_event(e.WAITED)
         else:
+            record_invalid_action(self, agent, action)
             agent.add_event(e.INVALID_ACTION)
-
-        outcome_event = (
-            agent.events[-1]
-            if len(agent.events) > previous_event_count
-            else None
-        )
-        self.death_diagnostics.record_action(
-            world=self,
-            agent=agent,
-            requested_action=action,
-            outcome_event=outcome_event,
-            previous_position=previous_position,
-        )
 
     def poll_and_run_agents(self):
         raise NotImplementedError()
@@ -251,24 +231,7 @@ class GenericWorld:
                 # Create explosion
                 screen_coords = [(s.GRID_OFFSET[0] + s.GRID_SIZE * x, s.GRID_OFFSET[1] + s.GRID_SIZE * y) for (x, y) in
                                  blast_coords]
-                explosion = Explosion(
-                    blast_coords,
-                    screen_coords,
-                    bomb.owner,
-                    s.EXPLOSION_TIMER,
-                )
-                explosion.diagnostic_bomb_position = (bomb.x, bomb.y)
-                explosion.diagnostic_bomb_placed_round = getattr(
-                    bomb,
-                    "diagnostic_placed_round",
-                    self.round,
-                )
-                explosion.diagnostic_bomb_placed_step = getattr(
-                    bomb,
-                    "diagnostic_placed_step",
-                    None,
-                )
-                self.explosions.append(explosion)
+                self.explosions.append(Explosion(blast_coords, screen_coords, bomb.owner, s.EXPLOSION_TIMER))
                 bomb.active = False
             else:
                 # Progress countdown
@@ -278,14 +241,12 @@ class GenericWorld:
     def evaluate_explosions(self):
         # Explosions
         agents_hit = set()
-        diagnostic_causes = {}
         for explosion in self.explosions:
             # Kill agents
             if explosion.is_dangerous():
                 for a in self.active_agents:
                     if (not a.dead) and (a.x, a.y) in explosion.blast_coords:
                         agents_hit.add(a)
-                        diagnostic_causes.setdefault(a, []).append(explosion)
                         # Note who killed whom, adjust scores
                         if a is explosion.owner:
                             self.logger.info(f'Agent <{a.name}> blown up by own bomb')
@@ -300,11 +261,6 @@ class GenericWorld:
 
         # Remove hit agents
         for a in agents_hit:
-            self.death_diagnostics.record_death(
-                world=self,
-                victim=a,
-                explosions=diagnostic_causes.get(a, []),
-            )
             a.dead = True
             self.active_agents.remove(a)
             a.add_event(e.GOT_KILLED)
