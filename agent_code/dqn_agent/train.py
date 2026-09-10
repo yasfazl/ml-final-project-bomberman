@@ -9,7 +9,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..q_learning_agent.train import (
+from .base_train import (
+    BOMB_TARGETED_OPPONENT,
+    REWARD_BOMB_TARGETED_OPPONENT,
     add_bomb_placement_event,
     add_coin_distance_event,
     add_crate_efficiency_navigation_event,
@@ -33,6 +35,7 @@ from .callbacks import (
     state_to_features,
 )
 from .replay_buffer import ReplayBuffer
+from .reward_search_config import REWARD_SEARCH_CONFIG
 
 
 GAMMA = 0.90
@@ -59,14 +62,21 @@ WAITED_DURING_SAFE_ATTACK = "WAITED_DURING_SAFE_ATTACK"
 REWARD_MOVED_TOWARD_OPPONENT = 0.5
 REWARD_MOVED_AWAY_FROM_OPPONENT = -0.5
 REWARD_WAITED_DURING_ENDGAME = -1.0
-REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION = 0.5
-REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = -0.5
-REWARD_WAITED_DURING_SAFE_ATTACK = -1.0
+REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION = (
+    REWARD_SEARCH_CONFIG.progress_reward
+)
+REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = (
+    -REWARD_SEARCH_CONFIG.progress_reward
+)
+REWARD_WAITED_DURING_SAFE_ATTACK = -REWARD_SEARCH_CONFIG.wait_penalty
 
 
 def setup_training(self):
     """Train only the new safe-attack adapter input connections."""
-    self.replay_buffer = ReplayBuffer(REPLAY_CAPACITY)
+    self.replay_buffer = ReplayBuffer(
+        REPLAY_CAPACITY,
+        seed=REWARD_SEARCH_CONFIG.replay_seed,
+    )
 
     for parameter in self.policy_net.parameters():
         parameter.requires_grad_(False)
@@ -82,13 +92,21 @@ def setup_training(self):
         keep_only_safe_attack_feature_gradients
     )
     self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
-    if self.pending_optimizer_state is not None:
+    if (
+        self.pending_optimizer_state is not None
+        and not REWARD_SEARCH_CONFIG.fresh_optimizer
+    ):
         try:
             self.optimizer.load_state_dict(self.pending_optimizer_state)
         except (KeyError, RuntimeError, TypeError, ValueError) as error:
             self.logger.warning(
                 f"Could not restore optimizer state: {error}."
             )
+    elif REWARD_SEARCH_CONFIG.fresh_optimizer:
+        self.logger.info(
+            "Starting with a fresh optimizer for the controlled reward "
+            "search trial."
+        )
     self.pending_optimizer_state = None
     self.round_reward = 0.0
     self.round_losses = []
@@ -98,7 +116,8 @@ def setup_training(self):
         "Double DQN training initialized: "
         f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}, "
         f"endgame_epsilon={self.endgame_epsilon:.3f}, "
-        "trainable=safe_attack_input_adapter."
+        "trainable=safe_attack_input_adapter, "
+        f"reward_config={REWARD_SEARCH_CONFIG.checkpoint_metadata()}."
     )
 
 
@@ -187,16 +206,21 @@ def reward_from_events(self, events: List[str]) -> float:
         MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
         WAITED_DURING_ENDGAME: REWARD_WAITED_DURING_ENDGAME,
         MOVED_TOWARD_SAFE_ATTACK_POSITION: (
-            REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION
+            REWARD_SEARCH_CONFIG.progress_reward
         ),
         MOVED_AWAY_FROM_SAFE_ATTACK_POSITION: (
-            REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION
+            -REWARD_SEARCH_CONFIG.progress_reward
         ),
-        WAITED_DURING_SAFE_ATTACK: REWARD_WAITED_DURING_SAFE_ATTACK,
+        WAITED_DURING_SAFE_ATTACK: -REWARD_SEARCH_CONFIG.wait_penalty,
     }
+    targeted_bomb_adjustment = events.count(BOMB_TARGETED_OPPONENT) * (
+        REWARD_SEARCH_CONFIG.targeted_bomb_reward
+        - REWARD_BOMB_TARGETED_OPPONENT
+    )
     return float(
         reward
         + sum(endgame_rewards.get(event, 0.0) for event in events)
+        + targeted_bomb_adjustment
     )
 
 
@@ -442,8 +466,11 @@ def save_checkpoint(self) -> None:
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
         "endgame_epsilon": float(self.endgame_epsilon),
-        "training_scope": "safe_attack_input_adapter_only",
-        "algorithm": "safe_attack_staging_masked_double_dqn_v3",
+        "training_scope": "safe_attack_input_adapter_only_reward_search",
+        "algorithm": "safe_attack_reward_search_double_dqn_v6",
+        "reward_search_config": (
+            REWARD_SEARCH_CONFIG.checkpoint_metadata()
+        ),
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")

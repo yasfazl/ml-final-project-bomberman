@@ -10,7 +10,7 @@ import random
 import numpy as np
 import torch
 
-from ..q_learning_agent.callbacks import (
+from .base_callbacks import (
     ACTIONS,
     FEATURE_DIM as BASE_FEATURE_DIM,
     _anti_stall_candidate_indices,
@@ -23,7 +23,7 @@ from ..q_learning_agent.callbacks import (
     state_to_features as base_state_to_features,
     valid_action_indices,
 )
-from ..q_learning_agent.game_utils import (
+from .game_utils import (
     DIRECTIONS,
     bomb_has_robust_escape_route,
     bomb_target_counts,
@@ -41,11 +41,7 @@ ENDGAME_EPSILON_START = 0.20
 ENDGAME_EPSILON_MIN = 0.05
 ENDGAME_WAIT_LIMIT = 2
 DQN_MODEL_PATH = Path(__file__).resolve().parent / "dqn_model.pt"
-LINEAR_TEACHER_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "q_learning_agent"
-    / "q_model.pkl"
-)
+LINEAR_TEACHER_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
 
 def _select_device(logger) -> torch.device:

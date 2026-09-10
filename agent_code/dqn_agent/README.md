@@ -1,7 +1,10 @@
 # Safe-attack warm-started Double DQN agent
 
-This agent is separate from `q_learning_agent`. It preserves the selected
-v2.2 39-feature representation and every existing safety filter. Six gated
+This agent is self-contained: the frozen Q-learning feature, safety, and
+reward helpers are vendored as `base_callbacks.py`, `game_utils.py`, and
+`base_train.py`, so no sibling agent directory is required at submission
+time. It preserves the selected v2.2 39-feature representation and every
+existing safety filter. Six gated
 endgame inputs extend the network to 45 dimensions: pursuit-active, four path
 directions, and normalized opponent distance. Version 3 adds seven strictly
 gated safe-attack inputs, for a total of 52 dimensions: attack-mode active,
@@ -45,3 +48,11 @@ Focused safe-attack training:
 
 The learned checkpoint is saved only as
 `agent_code/dqn_agent/dqn_model.pt`. Evaluation must omit `--train 1`.
+
+## V6 reward-search instrumentation
+
+`reward_search_config.py` preserves the V3 reward values by default and
+permits three bounded, training-only overrides for the controlled Optuna
+study. It also supports a fresh optimizer and deterministic replay sampling.
+Candidate checkpoints need no environment variables during evaluation. See
+`DQN_REWARD_BAYES_V6_README.md` at the repository root.
