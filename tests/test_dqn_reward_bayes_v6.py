@@ -2,12 +2,10 @@ import json
 
 import pytest
 
-from agent_code.dqn_agent import train as dqn_train
 from agent_code.dqn_agent.reward_search_config import (
     FRESH_OPTIMIZER_ENV,
     PROGRESS_REWARD_ENV,
     REPLAY_SEED_ENV,
-    RewardSearchConfig,
     TARGETED_BOMB_REWARD_ENV,
     WAIT_PENALTY_ENV,
     read_reward_search_config,
@@ -49,47 +47,6 @@ def test_reward_search_reads_controlled_overrides():
 def test_reward_search_rejects_out_of_range_value():
     with pytest.raises(ValueError, match=PROGRESS_REWARD_ENV):
         read_reward_search_config({PROGRESS_REWARD_ENV: "2.0"})
-
-
-def test_default_reward_search_values_leave_v3_reward_unchanged(monkeypatch):
-    monkeypatch.setattr(
-        dqn_train,
-        "REWARD_SEARCH_CONFIG",
-        RewardSearchConfig(),
-    )
-    monkeypatch.setattr(
-        dqn_train,
-        "base_reward_from_events",
-        lambda _self, _events: 4.0,
-    )
-    events = [
-        dqn_train.BOMB_TARGETED_OPPONENT,
-        dqn_train.MOVED_TOWARD_SAFE_ATTACK_POSITION,
-    ]
-    assert dqn_train.reward_from_events(object(), events) == 4.5
-
-
-def test_reward_search_values_adjust_only_the_selected_terms(monkeypatch):
-    monkeypatch.setattr(
-        dqn_train,
-        "REWARD_SEARCH_CONFIG",
-        RewardSearchConfig(
-            progress_reward=0.25,
-            wait_penalty=1.5,
-            targeted_bomb_reward=2.0,
-        ),
-    )
-    monkeypatch.setattr(
-        dqn_train,
-        "base_reward_from_events",
-        lambda _self, _events: 4.0,
-    )
-    events = [
-        dqn_train.BOMB_TARGETED_OPPONENT,
-        dqn_train.MOVED_TOWARD_SAFE_ATTACK_POSITION,
-        dqn_train.WAITED_DURING_SAFE_ATTACK,
-    ]
-    assert dqn_train.reward_from_events(object(), events) == 0.75
 
 
 def test_aggregate_runs_normalizes_to_one_hundred_rounds():

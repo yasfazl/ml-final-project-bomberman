@@ -1,7 +1,6 @@
 import numpy as np
 
 from agent_code.dqn_agent import callbacks as dqn_callbacks
-from agent_code.dqn_agent import train as dqn_train
 
 
 def open_field(size=11):
@@ -127,65 +126,3 @@ def test_safe_attack_features_are_zero_in_every_other_mode(monkeypatch):
     for state in states:
         features = dqn_callbacks.state_to_features(state)
         assert not features[45:52].any()
-
-
-def test_safe_attack_navigation_shaping_uses_our_move(monkeypatch):
-    def fake_path(state):
-        position = tuple(state["self"][3])
-        mapping = {
-            (5, 5): (0, 2, False),
-            (5, 4): (0, 1, False),
-            (6, 5): (None, None, False),
-        }
-        return mapping[position]
-
-    monkeypatch.setattr(
-        dqn_train,
-        "safe_opponent_bombing_path",
-        fake_path,
-    )
-    toward_events = []
-    away_events = []
-    dqn_train.add_safe_attack_navigation_event(
-        attack_state(position=(5, 5)),
-        attack_state(position=(5, 4)),
-        toward_events,
-    )
-    dqn_train.add_safe_attack_navigation_event(
-        attack_state(position=(5, 5)),
-        attack_state(position=(6, 5)),
-        away_events,
-    )
-    assert toward_events == [
-        dqn_train.MOVED_TOWARD_SAFE_ATTACK_POSITION
-    ]
-    assert away_events == [
-        dqn_train.MOVED_AWAY_FROM_SAFE_ATTACK_POSITION
-    ]
-
-
-def test_safe_attack_wait_penalty_is_strictly_gated(monkeypatch):
-    monkeypatch.setattr(
-        dqn_train,
-        "endgame_safe_attack_active",
-        lambda state: bool(state.get("attack_mode")),
-    )
-    active_state = {"attack_mode": True}
-    inactive_state = {"attack_mode": False}
-    events = []
-    dqn_train.add_safe_attack_waiting_event(
-        active_state,
-        "WAIT",
-        events,
-    )
-    dqn_train.add_safe_attack_waiting_event(
-        inactive_state,
-        "WAIT",
-        events,
-    )
-    dqn_train.add_safe_attack_waiting_event(
-        active_state,
-        "UP",
-        events,
-    )
-    assert events == [dqn_train.WAITED_DURING_SAFE_ATTACK]

@@ -26,16 +26,19 @@ from .callbacks import (
     ENDGAME_EPSILON_MIN,
     FEATURE_DIM,
     PREVIOUS_FEATURE_DIM,
-    _state_with_agent_position,
     candidate_action_mask,
     endgame_opponent_pursuit_active,
     endgame_safe_attack_active,
     nearest_opponent_path,
-    safe_opponent_bombing_path,
     state_to_features,
 )
 from .replay_buffer import ReplayBuffer
-from .reward_search_config import REWARD_SEARCH_CONFIG
+from .potential_shaping import (
+    POST_BOMB_PRESSURE_POTENTIAL,
+    POTENTIAL_SCALE,
+    READY_TO_BOMB_POTENTIAL,
+    potential_difference,
+)
 
 
 GAMMA = 0.90
@@ -47,35 +50,21 @@ TARGET_SYNC_INTERVAL = 1_000
 GRADIENT_CLIP_NORM = 10.0
 EPSILON_MIN = 0.05
 EPSILON_DECAY = 0.995
+V7_REPLAY_SEED = 60_013
 
 MOVED_TOWARD_OPPONENT = "MOVED_TOWARD_OPPONENT"
 MOVED_AWAY_FROM_OPPONENT = "MOVED_AWAY_FROM_OPPONENT"
 WAITED_DURING_ENDGAME = "WAITED_DURING_ENDGAME"
-MOVED_TOWARD_SAFE_ATTACK_POSITION = (
-    "MOVED_TOWARD_SAFE_ATTACK_POSITION"
-)
-MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = (
-    "MOVED_AWAY_FROM_SAFE_ATTACK_POSITION"
-)
-WAITED_DURING_SAFE_ATTACK = "WAITED_DURING_SAFE_ATTACK"
-
 REWARD_MOVED_TOWARD_OPPONENT = 0.5
 REWARD_MOVED_AWAY_FROM_OPPONENT = -0.5
 REWARD_WAITED_DURING_ENDGAME = -1.0
-REWARD_MOVED_TOWARD_SAFE_ATTACK_POSITION = (
-    REWARD_SEARCH_CONFIG.progress_reward
-)
-REWARD_MOVED_AWAY_FROM_SAFE_ATTACK_POSITION = (
-    -REWARD_SEARCH_CONFIG.progress_reward
-)
-REWARD_WAITED_DURING_SAFE_ATTACK = -REWARD_SEARCH_CONFIG.wait_penalty
 
 
 def setup_training(self):
     """Train only the new safe-attack adapter input connections."""
     self.replay_buffer = ReplayBuffer(
         REPLAY_CAPACITY,
-        seed=REWARD_SEARCH_CONFIG.replay_seed,
+        seed=V7_REPLAY_SEED,
     )
 
     for parameter in self.policy_net.parameters():
@@ -92,21 +81,10 @@ def setup_training(self):
         keep_only_safe_attack_feature_gradients
     )
     self.optimizer = torch.optim.Adam([adapter_weight], lr=LEARNING_RATE)
-    if (
-        self.pending_optimizer_state is not None
-        and not REWARD_SEARCH_CONFIG.fresh_optimizer
-    ):
-        try:
-            self.optimizer.load_state_dict(self.pending_optimizer_state)
-        except (KeyError, RuntimeError, TypeError, ValueError) as error:
-            self.logger.warning(
-                f"Could not restore optimizer state: {error}."
-            )
-    elif REWARD_SEARCH_CONFIG.fresh_optimizer:
-        self.logger.info(
-            "Starting with a fresh optimizer for the controlled reward "
-            "search trial."
-        )
+    self.logger.info(
+        "Starting Potential-Shaping V7 with a fresh optimizer and "
+        f"replay seed {V7_REPLAY_SEED}."
+    )
     self.pending_optimizer_state = None
     self.round_reward = 0.0
     self.round_losses = []
@@ -117,7 +95,7 @@ def setup_training(self):
         f"episodes={self.episodes_trained}, epsilon={self.epsilon:.3f}, "
         f"endgame_epsilon={self.endgame_epsilon:.3f}, "
         "trainable=safe_attack_input_adapter, "
-        f"reward_config={REWARD_SEARCH_CONFIG.checkpoint_metadata()}."
+        f"potential_scale={POTENTIAL_SCALE}."
     )
 
 
@@ -158,69 +136,45 @@ def add_endgame_waiting_event(
         events.append(WAITED_DURING_ENDGAME)
 
 
-def add_safe_attack_navigation_event(
-    old_game_state: dict,
-    new_game_state: dict,
+def reward_from_events(
+    self,
     events: List[str],
-) -> None:
-    """Shape progress toward a robust opponent-targeting bomb tile."""
-    if old_game_state is None or new_game_state is None:
-        return
-
-    _old_direction, old_distance, safe_bomb_now = (
-        safe_opponent_bombing_path(old_game_state)
-    )
-    if safe_bomb_now or old_distance in (None, 0):
-        return
-
-    comparison_state = _state_with_agent_position(
-        old_game_state,
-        tuple(new_game_state["self"][3]),
-    )
-    _new_direction, new_distance, new_safe_bomb_now = (
-        safe_opponent_bombing_path(comparison_state)
-    )
-    if new_safe_bomb_now or (
-        new_distance is not None and new_distance < old_distance
-    ):
-        events.append(MOVED_TOWARD_SAFE_ATTACK_POSITION)
-    elif new_distance is None or new_distance > old_distance:
-        events.append(MOVED_AWAY_FROM_SAFE_ATTACK_POSITION)
-
-
-def add_safe_attack_waiting_event(
-    game_state: dict,
-    action: str,
-    events: List[str],
-) -> None:
-    """Discourage stalling only while the safe-attack adapter is active."""
-    if action == "WAIT" and endgame_safe_attack_active(game_state):
-        events.append(WAITED_DURING_SAFE_ATTACK)
-
-
-def reward_from_events(self, events: List[str]) -> float:
-    """Add endgame shaping without modifying v2.2's reward function."""
+    old_game_state: dict | None = None,
+) -> float:
+    """Return the stable reward without the replaced safe-attack bonus."""
     reward = base_reward_from_events(self, events)
     endgame_rewards = {
         MOVED_TOWARD_OPPONENT: REWARD_MOVED_TOWARD_OPPONENT,
         MOVED_AWAY_FROM_OPPONENT: REWARD_MOVED_AWAY_FROM_OPPONENT,
         WAITED_DURING_ENDGAME: REWARD_WAITED_DURING_ENDGAME,
-        MOVED_TOWARD_SAFE_ATTACK_POSITION: (
-            REWARD_SEARCH_CONFIG.progress_reward
-        ),
-        MOVED_AWAY_FROM_SAFE_ATTACK_POSITION: (
-            -REWARD_SEARCH_CONFIG.progress_reward
-        ),
-        WAITED_DURING_SAFE_ATTACK: -REWARD_SEARCH_CONFIG.wait_penalty,
     }
-    targeted_bomb_adjustment = events.count(BOMB_TARGETED_OPPONENT) * (
-        REWARD_SEARCH_CONFIG.targeted_bomb_reward
-        - REWARD_BOMB_TARGETED_OPPONENT
-    )
+    reward += sum(endgame_rewards.get(event, 0.0) for event in events)
+
+    if (
+        old_game_state is not None
+        and endgame_safe_attack_active(old_game_state)
+    ):
+        reward -= events.count(BOMB_TARGETED_OPPONENT) * (
+            REWARD_BOMB_TARGETED_OPPONENT
+        )
+    return float(reward)
+
+
+def transition_reward(
+    self,
+    old_game_state: dict | None,
+    new_game_state: dict | None,
+    events: List[str],
+) -> float:
+    """Add the bounded state-potential difference to the stable reward."""
     return float(
-        reward
-        + sum(endgame_rewards.get(event, 0.0) for event in events)
-        + targeted_bomb_adjustment
+        reward_from_events(self, events, old_game_state)
+        + potential_difference(
+            old_game_state,
+            new_game_state,
+            gamma=GAMMA,
+            scale=POTENTIAL_SCALE,
+        )
     )
 
 
@@ -285,17 +239,12 @@ def game_events_occurred(
         events,
     )
     add_endgame_waiting_event(old_game_state, self_action, events)
-    add_safe_attack_navigation_event(
+    reward = transition_reward(
+        self,
         old_game_state,
         new_game_state,
         events,
     )
-    add_safe_attack_waiting_event(
-        old_game_state,
-        self_action,
-        events,
-    )
-    reward = reward_from_events(self, events)
     _store_transition(
         self,
         old_game_state,
@@ -318,8 +267,12 @@ def end_of_round(
     """Store the terminal transition and save an atomic checkpoint."""
     add_bomb_placement_event(last_game_state, last_action, events)
     add_endgame_waiting_event(last_game_state, last_action, events)
-    add_safe_attack_waiting_event(last_game_state, last_action, events)
-    reward = reward_from_events(self, events)
+    reward = transition_reward(
+        self,
+        last_game_state,
+        None,
+        events,
+    )
     _store_transition(
         self,
         last_game_state,
@@ -446,7 +399,14 @@ def optimize_model(self) -> float | None:
         getattr(self, "target_sync_interval", TARGET_SYNC_INTERVAL)
     )
     if self.optimizer_steps % sync_interval == 0:
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+        with torch.no_grad():
+            self.target_net.network[0].weight[
+                :, PREVIOUS_FEATURE_DIM:
+            ].copy_(
+                self.policy_net.network[0].weight[
+                    :, PREVIOUS_FEATURE_DIM:
+                ]
+            )
     return float(loss.item())
 
 
@@ -466,11 +426,15 @@ def save_checkpoint(self) -> None:
         "optimizer_steps": int(self.optimizer_steps),
         "warm_started": bool(self.warm_started),
         "endgame_epsilon": float(self.endgame_epsilon),
-        "training_scope": "safe_attack_input_adapter_only_reward_search",
-        "algorithm": "safe_attack_reward_search_double_dqn_v6",
-        "reward_search_config": (
-            REWARD_SEARCH_CONFIG.checkpoint_metadata()
-        ),
+        "training_scope": "safe_attack_input_adapter_only_potential",
+        "algorithm": "potential_shaping_double_dqn_v7",
+        "potential_shaping": {
+            "gamma": GAMMA,
+            "scale": POTENTIAL_SCALE,
+            "ready_to_bomb": READY_TO_BOMB_POTENTIAL,
+            "post_bomb_pressure": POST_BOMB_PRESSURE_POTENTIAL,
+            "terminal_potential": 0.0,
+        },
     }
     model_path = Path(self.dqn_model_path)
     temporary_path = model_path.with_suffix(".tmp")

@@ -56,3 +56,26 @@ permits three bounded, training-only overrides for the controlled Optuna
 study. It also supports a fresh optimizer and deterministic replay sampling.
 Candidate checkpoints need no environment variables during evaluation. See
 `DQN_REWARD_BAYES_V6_README.md` at the repository root.
+
+## V7 potential-based shaping experiment
+
+V7 leaves the inference model and mode gates unchanged, but replaces the
+safe-attack movement, waiting, and immediate targeted-bomb training bonuses
+with the bounded state-potential difference
+
+```text
+5 * (0.9 * Phi(next_state) - Phi(state)).
+```
+
+`Phi` is zero outside opponent-only endgames and at terminal states.  It
+orders progress toward a robust attack tile below `0.1`, assigns `0.1` when a
+safe targeted bomb is ready, and assigns `1.0` to the immediate useful,
+escapable post-bomb state.  The ready-to-post-bomb transition therefore has a
+shaping reward of approximately `+4`, matching the replaced bonus scale
+without tuning it.
+
+Training uses a fresh optimizer and updates only input columns 45-51.  Target
+network synchronization is also restricted to those columns so all protected
+policy and target parameters remain unchanged.  Run the controlled experiment
+through `tools/train_dqn_potential_v7.py`; do not install its candidate until
+score-first validation is complete.
