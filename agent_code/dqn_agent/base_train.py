@@ -5,7 +5,7 @@ import pickle
 import numpy as np
 
 import events as e
-from .callbacks import (
+from .base_callbacks import (
     ACTIONS,
     MODEL_PATH,
     nearest_coin_path,
