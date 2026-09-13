@@ -41,6 +41,9 @@ ENDGAME_EPSILON_START = 0.20
 ENDGAME_EPSILON_MIN = 0.05
 ENDGAME_WAIT_LIMIT = 2
 DQN_MODEL_PATH = Path(__file__).resolve().parent / "dqn_model.pt"
+ENDGAME_DQN_MODEL_PATH = (
+    Path(__file__).resolve().parent / "dqn_model_trial8.pt"
+)
 LINEAR_TEACHER_PATH = Path(__file__).resolve().parent / "q_model.pkl"
 
 
@@ -106,6 +109,79 @@ def _migrate_network_state(state: dict, old_feature_dim: int) -> dict:
     expanded_weight[:, :old_feature_dim] = old_weight
     migrated[input_weight_name] = expanded_weight
     return migrated
+
+
+def _load_endgame_policy(self) -> None:
+    """Load the optional Trial-8 policy without modifying V3-75."""
+    self.endgame_dqn_model_path = ENDGAME_DQN_MODEL_PATH
+    self.endgame_policy_net = None
+    if not self.endgame_dqn_model_path.is_file():
+        self.logger.info(
+            "Trial-8 endgame checkpoint not found; using V3-75 for all "
+            "board phases."
+        )
+        return
+
+    try:
+        checkpoint = _load_torch_checkpoint(
+            self.endgame_dqn_model_path,
+            self.device,
+        )
+        checkpoint_version = int(checkpoint["checkpoint_version"])
+        if checkpoint_version not in {1, 2, CHECKPOINT_VERSION}:
+            raise ValueError("Unsupported endgame DQN checkpoint version.")
+        saved_feature_dim = int(checkpoint["feature_dim"])
+        if saved_feature_dim not in {
+            BASE_FEATURE_DIM,
+            PREVIOUS_FEATURE_DIM,
+            FEATURE_DIM,
+        }:
+            raise ValueError("Endgame DQN feature dimension mismatch.")
+        if list(checkpoint["actions"]) != ACTIONS:
+            raise ValueError("Endgame DQN action order mismatch.")
+
+        policy_state = _migrate_network_state(
+            checkpoint["policy_state"],
+            saved_feature_dim,
+        )
+        # Constructing a second network normally consumes PyTorch RNG values.
+        # Preserve the RNG state so V8 has exactly the same tie-breaking
+        # stream as V3-75 until their selected policies genuinely diverge.
+        torch_rng_state = torch.random.get_rng_state()
+        try:
+            endgame_policy_net = DQN(
+                FEATURE_DIM,
+                len(ACTIONS),
+                HIDDEN_DIM,
+            ).to(self.device)
+        finally:
+            torch.random.set_rng_state(torch_rng_state)
+        endgame_policy_net.load_state_dict(policy_state)
+        endgame_policy_net.eval()
+        for parameter in endgame_policy_net.parameters():
+            parameter.requires_grad_(False)
+        self.endgame_policy_net = endgame_policy_net
+        self.logger.info(
+            "Loaded Trial-8 as the zero-crate endgame policy."
+        )
+    except (OSError, KeyError, RuntimeError, TypeError, ValueError) as error:
+        self.logger.warning(
+            f"Could not load Trial-8 endgame checkpoint: {error}. "
+            "Using V3-75 for all board phases."
+        )
+
+
+def _policy_net_for_state(self, game_state: dict):
+    """Select V3-75 during crate play and Trial-8 after all crates."""
+    crates_remain = bool(np.any(np.asarray(game_state["field"]) == 1))
+    endgame_policy_net = getattr(self, "endgame_policy_net", None)
+    if (
+        not crates_remain
+        and not getattr(self, "train", False)
+        and endgame_policy_net is not None
+    ):
+        return endgame_policy_net, "trial8_endgame"
+    return self.policy_net, "v3_75"
 
 
 def nearest_opponent_path(
@@ -361,6 +437,7 @@ def setup(self):
     self.pending_optimizer_state = None
     self.feature_migrated = False
     self.endgame_epsilon = ENDGAME_EPSILON_START
+    self.active_policy_name = None
 
     self.last_own_bomb_position = None
     self.last_seen_round = None
@@ -467,6 +544,7 @@ def setup(self):
 
     self.policy_net.eval()
     self.target_net.eval()
+    _load_endgame_policy(self)
 
 
 def _movement_destination(
@@ -576,6 +654,13 @@ def act(self, game_state: dict) -> str:
     exploration_rate = (
         self.endgame_epsilon if endgame_adapter_active else self.epsilon
     )
+    active_policy_net, policy_name = _policy_net_for_state(
+        self,
+        game_state,
+    )
+    if getattr(self, "active_policy_name", None) != policy_name:
+        self.logger.info(f"DQN phase policy changed to {policy_name}.")
+        self.active_policy_name = policy_name
 
     if self.train and random.random() < exploration_rate:
         action_index = random.choice(candidates)
@@ -585,9 +670,9 @@ def act(self, game_state: dict) -> str:
             dtype=torch.float32,
             device=self.device,
         ).unsqueeze(0)
-        self.policy_net.eval()
+        active_policy_net.eval()
         with torch.no_grad():
-            q_values = self.policy_net(feature_tensor).squeeze(0)
+            q_values = active_policy_net(feature_tensor).squeeze(0)
         masked = torch.full_like(q_values, -torch.inf)
         masked[candidates] = q_values[candidates]
         best_value = torch.max(masked)
@@ -606,6 +691,7 @@ def act(self, game_state: dict) -> str:
     _record_anti_stall_choice(self, chosen_action, game_state)
     _record_endgame_position(self, game_state)
     self.logger.debug(
-        f"DQN selected {chosen_action} with epsilon={exploration_rate:.3f}."
+        f"DQN selected {chosen_action} with epsilon={exploration_rate:.3f} "
+        f"using {policy_name}."
     )
     return chosen_action
