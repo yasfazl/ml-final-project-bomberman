@@ -1,0 +1,81 @@
+# Safe-attack warm-started Double DQN agent
+
+This agent is self-contained: the frozen Q-learning feature, safety, and
+reward helpers are vendored as `base_callbacks.py`, `game_utils.py`, and
+`base_train.py`, so no sibling agent directory is required at submission
+time. It preserves the selected v2.2 39-feature representation and every
+existing safety filter. Six gated
+endgame inputs extend the network to 45 dimensions: pursuit-active, four path
+directions, and normalized opponent distance. Version 3 adds seven strictly
+gated safe-attack inputs, for a total of 52 dimensions: attack-mode active,
+four directions toward a robust bombing tile, normalized distance, and
+safe-bomb-now.
+
+A version-1 39-feature or version-2 45-feature DQN checkpoint is migrated
+automatically by adding zero input columns. Its existing Q-values therefore
+remain unchanged. When no DQN checkpoint exists, the network is exactly
+warm-started from the selected linear `q_model.pkl`.
+
+Only the seven safe-attack first-layer input connections are trainable. Every
+version-2 connection, including the existing pursuit adapter, is frozen.
+Safe-attack inputs are zero unless all coins and crates are gone, the board has
+no bomb or explosion danger, a bomb is available, and an opponent is already
+in the current blast line. The adapter then learns whether to bomb now or move
+toward the nearest opponent-targeting tile with a robust escape route.
+
+This is a learned residual behavior, not a deterministic action override.
+Coin, crate, danger, and ordinary pursuit decisions are exactly version 2
+before and after adapter training because the new inputs are zero there.
+
+Install PyTorch with the project environment:
+
+```bash
+~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python -m ensurepip --upgrade
+~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python -m pip install -r requirements-dqn.txt
+```
+
+Focused safe-attack training:
+
+```bash
+~/Desktop/bomberman_rl_nstep_agent/.venv/bin/python main.py play \
+  --agents dqn_agent rule_based_agent rule_based_agent rule_based_agent \
+  --train 1 \
+  --scenario empty \
+  --seed 123 \
+  --n-rounds 200 \
+  --no-gui
+```
+
+The learned checkpoint is saved only as
+`agent_code/dqn_agent/dqn_model.pt`. Evaluation must omit `--train 1`.
+
+## V6 reward-search instrumentation
+
+`reward_search_config.py` preserves the V3 reward values by default and
+permits three bounded, training-only overrides for the controlled Optuna
+study. It also supports a fresh optimizer and deterministic replay sampling.
+Candidate checkpoints need no environment variables during evaluation. See
+`DQN_REWARD_BAYES_V6_README.md` at the repository root.
+
+## V7 potential-based shaping experiment
+
+V7 leaves the inference model and mode gates unchanged, but replaces the
+safe-attack movement, waiting, and immediate targeted-bomb training bonuses
+with the bounded state-potential difference
+
+```text
+5 * (0.9 * Phi(next_state) - Phi(state)).
+```
+
+`Phi` is zero outside opponent-only endgames and at terminal states.  It
+orders progress toward a robust attack tile below `0.1`, assigns `0.1` when a
+safe targeted bomb is ready, and assigns `1.0` to the immediate useful,
+escapable post-bomb state.  The ready-to-post-bomb transition therefore has a
+shaping reward of approximately `+4`, matching the replaced bonus scale
+without tuning it.
+
+Training uses a fresh optimizer and updates only input columns 45-51.  Target
+network synchronization is also restricted to those columns so all protected
+policy and target parameters remain unchanged.  Run the controlled experiment
+through `tools/train_dqn_potential_v7.py`; do not install its candidate until
+score-first validation is complete.
