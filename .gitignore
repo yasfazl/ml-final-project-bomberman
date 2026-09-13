@@ -117,3 +117,10 @@ results/
 
 # Runtime logs
 logs/
+# Local training checkpoints
+checkpoints/
+
+# DQN checkpoints are generated locally during training.
+agent_code/dqn_agent/dqn_model.pt
+agent_code/dqn_agent/dqn_model.tmp
+agent_code/dqn_agent/logs/
