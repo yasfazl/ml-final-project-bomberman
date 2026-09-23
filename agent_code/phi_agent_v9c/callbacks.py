@@ -1,0 +1,966 @@
+"""
+Task 2 agent, action-conditioned linear Q-function.
+
+    Q(s, a) = w . phi(s, a)          (one shared weight vector)
+
+instead of the previous
+
+    Q(s, a) = W[a] . phi(s)          (one weight row per action)
+
+WHY
+---
+With a weight row per action, everything learned while moving LEFT was written
+to the LEFT row only. Measured on the previous model at epsilon=0, LEFT was
+0.9% of all actions, so the LEFT row was starved while the UP/DOWN rows were
+trained on 97% of the data.
+
+Worse, every direction-agnostic feature (bias, danger, crate_eff, trap) ended up
+with four *different* weights across the four move actions, even though the
+quantity it measures has nothing to do with direction. Those differences are
+sampling noise, not signal: the arena is rotation-symmetric (start corners are
+permuted in environment.py, crates are i.i.d.), so no direction is inherently
+better. Measured spread of that noise was 10.68 in total, while the escape
+signal it had to beat was only 0.26 - 2.81. Escape accuracy per direction was
+UP 98.6% / RIGHT 85.2% / DOWN 90.6% / LEFT 77.0%; equalising the noise by hand
+lifted the total from 88.3% to 95.6%.
+
+HOW
+---
+The four direction blocks are rolled into the frame of the action being scored,
+so index 0 always means "the way I am considering going":
+
+    slot 0 = ahead        slot 1 = right-hand
+    slot 2 = behind       slot 3 = left-hand
+
+(ACTIONS is ordered clockwise, so np.roll(block, -a) produces exactly this.)
+
+Rolling is a permutation, so no information is lost. What is lost -- deliberately
+-- is the ability to say "UP is intrinsically better than LEFT".
+
+The four move actions then share one set of weights, and the direction-agnostic
+features contribute the same amount to all four, so they cancel in the argmax
+over directions. They still separate move / WAIT / BOMB, which have their own
+blocks.
+
+    move 28 + wait 9 + bomb 7 = 44 parameters   (previously 6 x 22 = 132)
+"""
+from collections import deque
+from pathlib import Path
+import pickle
+import random
+
+import numpy as np
+
+
+ACTIONS = ["UP", "RIGHT", "DOWN", "LEFT", "WAIT", "BOMB"]
+
+MOVE_ACTIONS = ["UP", "RIGHT", "DOWN", "LEFT"]
+
+# Clockwise. np.roll(block, -a) therefore yields [ahead, right, behind, left].
+DIRECTIONS = {
+    "UP": (0, -1),
+    "RIGHT": (1, 0),
+    "DOWN": (0, 1),
+    "LEFT": (-1, 0),
+}
+
+# ---------------------------------------------------------------------------
+# phi(s, a) layout
+# ---------------------------------------------------------------------------
+# MOVE block -- active only when a is UP/RIGHT/DOWN/LEFT. Shared by all four.
+#   0        move bias
+#   1 -  3   can walk this way          [right, behind, left]
+#   4 -  7   BFS target lies this way   [ahead, right, behind, left]
+#   8 - 11   explosion ongoing this way [ahead, right, behind, left]
+#  12 - 15   live bomb covers the tile  [ahead, right, behind, left]
+#  16 - 19   escape route starts here   [ahead, right, behind, left]
+#  20        a coin is visible
+#  21        normalised distance to nearest target
+#  22        danger_countdown of the tile we stand on
+#  23        explosion_efficiency of the tile we stand on
+#  24        dropping a bomb here would trap us
+#  25        danger x escape-ahead        (interaction)
+#  26        target distance x target-ahead (interaction)
+#  27        nearest enemy lies ahead x how close it is
+#
+# Slot 27 is the only direction-carrying enemy feature, and it is ONE slot, not
+# a rolled block of four. After rolling, slot 0 already means "the direction
+# being scored", so a single slot separates "this move walks toward the nearest
+# enemy" from "this move does not". The three remaining directions would only
+# add the distinction between backing straight off and stepping sideways, which
+# in a corridor is not the same as a good escape anyway -- while costing three
+# more direction-specific weights, i.e. exactly the per-direction noise that
+# phi(s, a) was introduced to remove.
+#
+# It is a product rather than a bare one-hot because an enemy twenty tiles away
+# should not steer anything. Proximity decays to 0 beyond ENEMY_RANGE, so the
+# term switches itself off. Slot 26 is the same construction for targets.
+#
+# The SIGN is deliberately not decided here. A positive weight makes the agent
+# chase, a negative one makes it flee; which is worth more is what training is
+# for.
+#
+# "can walk AHEAD" is absent on purpose. valid_action_indices drops illegal
+# moves before act() ever scores them, so that slot was 1 in every state where a
+# move action is evaluated -- perfectly collinear with the move bias. Measured on
+# the 45-feature models it split the constant exactly in half (bias 3.22,
+# can-walk-ahead 3.22, identical to the last digit) while carrying no
+# information. Four more slots were dropped for the same kind of reason, each
+# having stayed at exactly 0.00 across 3000 episodes:
+#
+#   BOMB danger / BOMB escape exists   BOMB is only legal while no bomb of ours
+#                                      is live, so danger there is always 0
+#   WAIT trap                          WAIT was never chosen on a trap tile
+#   danger x explosion-ahead           needs a live bomb on our tile AND fire in
+#                                      the tile ahead; that never co-occurred
+#
+# Slots 13-16 complete the time axis that features 9-12 only half covered:
+#
+#     9 - 12   fire that has ALREADY gone off   (explosion_map)
+#    13 - 16   fire that is ABOUT to go off     (live bombs), relative to here
+#
+# Without them nothing described the tile the agent was about to step onto. Only
+# feature 23 mentions bomb danger and it describes the tile already occupied, and
+# the escape block (17-20) switches off the moment the agent reaches safety --
+# escape_path returns direction None once the current tile is clear, so the blast
+# map it computed internally is discarded. Standing safe one step after its own
+# bomb, the agent therefore had exactly one direction signal left, the BFS target,
+# which points back at the crate it just bombed. It walked back in and died.
+#
+# One tile of lookahead is enough: dying requires stepping onto a covered tile,
+# and every such step is preceded by a state where that tile is "ahead". The
+# value is graded (0.25 -> 1.0), so "just placed, safe to cross" stays separable
+# from "detonating now".
+#
+# WAIT block -- rotation-invariant summaries only, so no direction bias can
+# creep back in through this block.
+#  27        wait bias
+#  28        number of legal moves / 4
+#  29        a coin is visible
+#  30        normalised distance to nearest target
+#  31        danger_countdown
+#  32        explosion_efficiency
+#  34        an escape route exists
+#  35        adjacent ongoing explosions / 4
+#  36        how close the nearest enemy is
+#
+# BOMB block
+#  37        bomb bias
+#  38        number of legal moves / 4
+#  39        explosion_efficiency
+#  40        bomb here would trap us
+#  41        a coin is visible
+#  42        opponents a bomb here would cover / MAX_OPPONENTS
+#  43        how close the nearest enemy is
+#
+# Slot 42 is the opponent counterpart of crate_efficiency (39), and it is the
+# feature without which attacking cannot be represented at all: KILLED_OPPONENT
+# is worth +20 in train.py, but if phi looks identical whether or not an
+# opponent stands in the blast, that reward has nothing to attach to. This is
+# the same failure mode as a reward that counts crates while the features cannot
+# see crates -- only pointed the other way.
+#
+# Slot 43 exists because most real kills come from cutting off an escape route,
+# not from catching someone who is already standing in the cross. Slot 42 only
+# sees the latter. It is the least certain of the four additions and is the one
+# to drop first if the feature count has to come back down.
+MOVE_OFFSET, MOVE_DIM = 0, 28
+WAIT_OFFSET, WAIT_DIM = 28, 9
+BOMB_OFFSET, BOMB_DIM = 37, 7
+
+FEATURE_DIM = MOVE_DIM + WAIT_DIM + BOMB_DIM   # 44
+
+# Interaction features 25-26. Set to False to ablate them; the vector keeps its
+# length either way, so models stay loadable across the switch.
+USE_INTERACTIONS = True
+
+# Direction block 13-16, "a live bomb covers the tile that way". Set to False to
+# reproduce the 41-feature behaviour, which escaped its own bomb perfectly and
+# then stepped straight back into the blast. Length is unchanged either way.
+USE_DANGER_AHEAD = True
+
+# Which BFS supplies the "target" direction block.
+#
+#   True  -> nearest_target_path: coins first, crates as fallback
+#   False -> nearest_coin_path:   coins only (what Task 1 shipped)
+#
+# game_state["coins"] holds only *collectable* coins (environment.py:407), and
+# in classic the coins start inside crates, so early in a round that list is
+# empty. With coins-only targeting the whole target block is then zero, and in a
+# safe tile with no explosion and no bomb NOTHING in the move block distinguishes
+# the four directions except local geometry -- which is the same every time the
+# agent stands there, so it walks in circles.
+#
+# train.py already hands out MOVED_TOWARD_TARGET / MOVED_AWAY_FROM_TARGET using
+# nearest_target_path, i.e. it rewarded walking toward crates while the features
+# refused to show where the crates were. train.py now reads the distance out of
+# this summary instead of running its own BFS, so this switch moves the feature
+# AND the reward together. That is deliberate: the two disagreeing is exactly
+# the bug that made the agent walk in circles.
+USE_CRATE_TARGETS = True
+
+# Set to True to disable bomb placement (e.g. for coin-heaven training).
+DISABLE_BOMB = False
+
+# Bomb blast range in tiles (matches settings.py BOMB_POWER = 3)
+BOMB_POWER = 3
+
+# Steps until a freshly placed bomb explodes (matches settings.py BOMB_TIMER = 4)
+BOMB_TIMER = 4
+
+# Maximum crates a single bomb can destroy (board geometry constraint)
+MAX_CRATES = 9
+
+# Number of opponents, used to normalise blast_enemy_count (settings.py
+# MAX_AGENTS = 4, so at most three others).
+MAX_OPPONENTS = 3
+
+# BFS distance beyond which an opponent is treated as irrelevant. Proximity is
+# max(0, 1 - distance / ENEMY_RANGE), so it reaches 0 here and the direction
+# feature (slot 27) switches itself off with it.
+#
+# 8 is a first guess, not a measurement: it is roughly half the arena's 17-tile
+# side, and a bomb takes 4 steps to detonate. It should be re-picked from the
+# firing-rate probe rather than left at this value on trust.
+ENEMY_RANGE = 8
+
+MODEL_PATH = Path(__file__).resolve().parent / "q_model.pkl"
+
+
+def setup(self):
+    """
+    Initialise or load the Q-learning model.
+
+    The model is now a single weight vector, not one row per action.
+    """
+    self.model_path = MODEL_PATH
+
+    self.model = np.zeros(FEATURE_DIM, dtype=np.float64)
+    self.epsilon = 1.0
+    self.episodes_trained = 0
+
+    if self.model_path.is_file():
+        try:
+            with self.model_path.open("rb") as file:
+                saved_data = pickle.load(file)
+
+            saved_weights = saved_data["weights"]
+
+            if saved_weights.shape != (FEATURE_DIM,):
+                raise ValueError(
+                    f"Expected model shape {(FEATURE_DIM,)}, "
+                    f"but found {saved_weights.shape}. A (6, 22) model belongs "
+                    "to an earlier feature layout and cannot be reused."
+                )
+
+            self.model = saved_weights
+            self.epsilon = saved_data.get("epsilon", 1.0)
+            self.episodes_trained = saved_data.get("episodes_trained", 0)
+
+            self.logger.info(
+                f"Loaded Q-learning model after "
+                f"{self.episodes_trained} training episodes."
+            )
+
+        except (OSError, KeyError, TypeError, ValueError, pickle.PickleError) as error:
+            self.logger.warning(
+                f"Could not load saved model: {error}. "
+                "Starting with a new model."
+            )
+    else:
+        self.logger.info("No saved model found. Starting from scratch.")
+
+
+def act(self, game_state: dict) -> str:
+    """
+    Select an action using an epsilon-greedy strategy.
+    """
+    if game_state is None:
+        return "WAIT"
+
+    summary = state_summary(game_state)
+    valid_indices = summary["valid_indices"]
+
+    if self.train and random.random() < self.epsilon:
+        action_index = random.choice(valid_indices)
+        self.logger.debug(
+            f"Exploration: selected {ACTIONS[action_index]} "
+            f"with epsilon={self.epsilon:.3f}"
+        )
+        return ACTIONS[action_index]
+
+    q_values = action_values(self.model, summary)
+
+    masked_q_values = np.full(len(ACTIONS), -np.inf)
+    masked_q_values[valid_indices] = q_values[valid_indices]
+
+    best_q_value = np.max(masked_q_values)
+
+    best_indices = np.flatnonzero(
+        np.isclose(masked_q_values, best_q_value)
+    )
+    action_index = int(np.random.choice(best_indices))
+
+    self.logger.debug(
+        f"Exploitation: selected {ACTIONS[action_index]}, "
+        f"Q-values={q_values}"
+    )
+
+    return ACTIONS[action_index]
+
+
+def valid_action_indices(game_state: dict) -> list[int]:
+    """
+    Return the indices of currently valid actions.
+    """
+    field = game_state["field"]
+    x, y = game_state["self"][3]
+    can_place_bomb = game_state["self"][2]
+
+    blocked_positions = {
+        position for position, _timer in game_state["bombs"]
+    }
+    blocked_positions.update(
+        other_agent[3] for other_agent in game_state["others"]
+    )
+
+    valid_indices = []
+
+    for action_index, action in enumerate(MOVE_ACTIONS):
+        dx, dy = DIRECTIONS[action]
+        next_position = (x + dx, y + dy)
+
+        if (
+            field[next_position] == 0
+            and next_position not in blocked_positions
+        ):
+            valid_indices.append(action_index)
+
+    valid_indices.append(ACTIONS.index("WAIT"))
+
+    if can_place_bomb and not DISABLE_BOMB:
+        valid_indices.append(ACTIONS.index("BOMB"))
+
+    return valid_indices
+
+
+
+# ---------------------------------------------------------------------------
+# phi(s, a)
+# ---------------------------------------------------------------------------
+
+def state_summary(game_state: dict) -> dict | None:
+    """
+    Everything about the state that phi() needs, computed once.
+
+    The BFS calls (nearest_coin_path, escape_path) are the expensive part, so
+    they happen here and the six phi() calls that follow are cheap array work.
+
+    Every quantity below is defined exactly as in the previous agent's
+    state_to_features; only the way they are laid out into a vector changes.
+    """
+    if game_state is None:
+        return None
+
+    x, y = game_state["self"][3]
+    field = game_state["field"]
+    bombs = game_state["bombs"]
+    explosion_map = game_state["explosion_map"]
+    other_positions = tuple(other_agent[3] for other_agent in game_state["others"])
+
+    valid_indices = valid_action_indices(game_state)
+
+    walkable = np.zeros(4, dtype=np.float64)
+    for action_index in range(4):
+        walkable[action_index] = float(action_index in valid_indices)
+
+    # Target direction and distance.
+    #
+    # coin_visible keeps its Task 1 meaning ("is any collectable coin on the
+    # board"). It is deliberately NOT "does a target exist": with crates as a
+    # fallback a target almost always exists, so such a feature would be a
+    # constant, i.e. a second copy of the block's bias carrying no information.
+    target = np.zeros(4, dtype=np.float64)
+    target_distance = 0.0
+    coin_visible = float(bool(game_state["coins"]))
+
+    if USE_CRATE_TARGETS:
+        direction_index, distance = nearest_target_path(game_state)
+    elif game_state["coins"]:
+        direction_index, distance = nearest_coin_path(game_state)
+    else:
+        direction_index, distance = None, None
+
+    if direction_index is not None:
+        target[direction_index] = 1.0
+
+        maximum_distance = field.shape[0] + field.shape[1]
+
+        if distance is None:
+            target_distance = 1.0
+        else:
+            target_distance = min(distance / maximum_distance, 1.0)
+
+    danger = danger_countdown(x, y, field, bombs)
+
+    explosion = np.zeros(4, dtype=np.float64)
+    for direction_index, action in enumerate(MOVE_ACTIONS):
+        dx, dy = DIRECTIONS[action]
+        nx, ny = x + dx, y + dy
+
+        if 0 <= nx < field.shape[0] and 0 <= ny < field.shape[1]:
+            explosion[direction_index] = float(explosion_map[nx, ny] > 0)
+
+    # How much MORE threatened the neighbouring tile is than the one we stand on.
+    #
+    # The absolute version of this feature (just danger_countdown of the tile
+    # ahead) made things worse, and the reason is geometry: a blast is a cross of
+    # radius BOMB_POWER, so walking out of one means walking along covered tiles.
+    # The feature therefore fired on every step of an escape, taxing exactly the
+    # moves that save the agent -- while WAIT, having no tile "ahead", paid
+    # nothing. Measured on that version, right after dropping a bomb WAIT beat
+    # every move at 2, 3 and 4 exits, so the agent burned the first of its four
+    # escape moves standing still and then could not cover the distance.
+    #
+    # Taking the difference removes that. One bomb gives every tile it covers the
+    # same countdown, so the term is exactly 0 while escaping, and the clamp keeps
+    # it 0 when stepping from a covered tile to a clear one. What survives is the
+    # case it was built for: standing safe and stepping into a live blast.
+    neighbour_danger = np.zeros(4, dtype=np.float64)
+
+    if USE_DANGER_AHEAD and bombs:
+        here = danger_countdown(x, y, field, bombs)
+
+        for direction_index, action in enumerate(MOVE_ACTIONS):
+            dx, dy = DIRECTIONS[action]
+            nx, ny = x + dx, y + dy
+
+            if 0 <= nx < field.shape[0] and 0 <= ny < field.shape[1]:
+                ahead = danger_countdown(nx, ny, field, bombs)
+                neighbour_danger[direction_index] = max(0.0, ahead - here)
+
+    crate_efficiency = blast_crate_count(x, y, field) / MAX_CRATES
+
+    if DISABLE_BOMB:
+        # Bombs are disabled, so the question is meaningless.
+        trap = 0.0
+    else:
+        _, escapable_if_bombed = escape_path(
+            x, y, field, bombs, hypothetical=True, others=other_positions
+        )
+        trap = float(not escapable_if_bombed)
+
+    # Opponents.
+    #
+    # Everything above already reacts to enemy BOMBS -- danger_countdown and
+    # neighbour_danger are handed game_state["bombs"] whole, which includes
+    # theirs -- and already treats enemy BODIES as obstacles, in
+    # valid_action_indices, escape_path and nearest_target_path. What no
+    # feature has described until now is the opponents themselves, as something
+    # to walk toward, walk away from, or blow up.
+    enemy = np.zeros(4, dtype=np.float64)
+    enemy_proximity = 0.0
+
+    if other_positions:
+        enemy_direction, enemy_distance = nearest_enemy_path(game_state)
+
+        if enemy_direction is not None and enemy_distance is not None:
+            enemy[enemy_direction] = 1.0
+            enemy_proximity = max(0.0, 1.0 - enemy_distance / ENEMY_RANGE)
+
+    # Not gated on DISABLE_BOMB, for the same reason crate_efficiency is not:
+    # it describes the tile, not a decision to bomb it.
+    enemy_in_blast = (
+        blast_enemy_count(x, y, field, other_positions) / MAX_OPPONENTS
+    )
+
+    escape = np.zeros(4, dtype=np.float64)
+    escape_exists = 0.0
+
+    if not DISABLE_BOMB:
+        escape_dir, can_escape = escape_path(
+            x, y, field, bombs, hypothetical=False, others=other_positions
+        )
+        if can_escape and escape_dir is not None:
+            escape[escape_dir] = 1.0
+            escape_exists = 1.0
+
+    return {
+        "valid_indices": valid_indices,
+        "walkable": walkable,
+        "target": target,
+        "coin_visible": coin_visible,
+        "target_distance": target_distance,
+        # Unnormalised BFS distance, so train.py can fire MOVED_TOWARD_TARGET
+        # off the same number the features use instead of repeating the BFS.
+        "target_distance_raw": distance,
+        "danger": danger,
+        "explosion": explosion,
+        "neighbour_danger": neighbour_danger,
+        "crate_efficiency": crate_efficiency,
+        "trap": trap,
+        "escape": escape,
+        "escape_exists": escape_exists,
+        "enemy": enemy,
+        "enemy_proximity": enemy_proximity,
+        "enemy_in_blast": enemy_in_blast,
+    }
+
+
+def phi(summary: dict, action_index: int) -> np.ndarray:
+    """
+    Build the feature vector for one (state, action) pair.
+
+    For a move action the four direction blocks are rolled so that slot 0 is
+    the direction being scored. For WAIT and BOMB there is no direction, so
+    their blocks hold rotation-invariant summaries (counts and scalars) only.
+    """
+    vector = np.zeros(FEATURE_DIM, dtype=np.float64)
+
+    if action_index < 4:
+        # np.roll(block, -a) puts the scored direction in slot 0 and, because
+        # ACTIONS is ordered clockwise, leaves [ahead, right, behind, left].
+        walkable  = np.roll(summary["walkable"],  -action_index)
+        target    = np.roll(summary["target"],    -action_index)
+        explosion = np.roll(summary["explosion"], -action_index)
+        bomb_ahead = np.roll(summary["neighbour_danger"], -action_index)
+        escape    = np.roll(summary["escape"],    -action_index)
+        enemy     = np.roll(summary["enemy"],     -action_index)
+
+        vector[0]      = 1.0
+        vector[1:4]    = walkable[1:]        # ahead omitted: see layout note
+        vector[4:8]    = target
+        vector[8:12]   = explosion
+        vector[12:16]  = bomb_ahead
+        vector[16:20]  = escape
+        vector[20]     = summary["coin_visible"]
+        vector[21]     = summary["target_distance"]
+        vector[22]     = summary["danger"]
+        vector[23]     = summary["crate_efficiency"]
+        vector[24]     = summary["trap"]
+
+        if USE_INTERACTIONS:
+            # A linear model cannot form products on its own, and tying the
+            # weights across directions removes the crude stand-in the
+            # per-action rows used to provide. These three are the products the
+            # policy actually needs: how much the escape direction matters
+            # depends on how urgent the danger is.
+            vector[25] = summary["danger"] * escape[0]
+            vector[26] = summary["target_distance"] * target[0]
+
+        # Outside USE_INTERACTIONS on purpose: this is the only thing that tells
+        # a move action an opponent exists at all, so ablating the interaction
+        # experiment must not silently remove enemy awareness with it.
+        vector[27] = enemy[0] * summary["enemy_proximity"]
+
+    elif action_index == ACTIONS.index("WAIT"):
+        vector[WAIT_OFFSET + 0] = 1.0
+        vector[WAIT_OFFSET + 1] = summary["walkable"].sum() / 4.0
+        vector[WAIT_OFFSET + 2] = summary["coin_visible"]
+        vector[WAIT_OFFSET + 3] = summary["target_distance"]
+        vector[WAIT_OFFSET + 4] = summary["danger"]
+        vector[WAIT_OFFSET + 5] = summary["crate_efficiency"]
+        vector[WAIT_OFFSET + 6] = summary["escape_exists"]
+        vector[WAIT_OFFSET + 7] = summary["explosion"].sum() / 4.0
+        vector[WAIT_OFFSET + 8] = summary["enemy_proximity"]
+
+    else:
+        vector[BOMB_OFFSET + 0] = 1.0
+        vector[BOMB_OFFSET + 1] = summary["walkable"].sum() / 4.0
+        vector[BOMB_OFFSET + 2] = summary["crate_efficiency"]
+        vector[BOMB_OFFSET + 3] = summary["trap"]
+        vector[BOMB_OFFSET + 4] = summary["coin_visible"]
+        vector[BOMB_OFFSET + 5] = summary["enemy_in_blast"]
+        vector[BOMB_OFFSET + 6] = summary["enemy_proximity"]
+
+    return vector
+
+
+def action_values(model: np.ndarray, summary: dict) -> np.ndarray:
+    """
+    Q(s, a) for all six actions. Unmasked -- callers apply valid_indices.
+    """
+    return np.array(
+        [model @ phi(summary, action_index) for action_index in range(len(ACTIONS))]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def danger_countdown(
+    x: int,
+    y: int,
+    field: np.ndarray,
+    bombs: list,
+) -> float:
+    """
+    Return how urgently (x, y) is threatened, on a 0.0 - 1.0 scale.
+
+        0.0  = safe: no bomb covers this tile
+        0.25 = a bomb covers it, 3 steps left
+        1.00 = a bomb covers it and explodes now
+
+    Safe must map to 0.0, not to a non-zero constant. Roughly 90% of steps are
+    safe, so a non-zero "safe" value would be a second copy of the bias feature:
+    the two weights could trade off freely against each other, which leaves them
+    undetermined and lets a feature carrying no information dominate the Q-values.
+
+    NOTE: larger now means MORE dangerous. The previous version returned the raw
+    timer (4.0 = safe), so any comparison of two danger values has the opposite
+    sense from before -- see game_events_occurred in train.py.
+    """
+    min_countdown = None
+
+    for (bx, by), timer in bombs:
+        if _in_blast_path(x, y, bx, by, field):
+            if min_countdown is None or timer < min_countdown:
+                min_countdown = timer
+
+    if min_countdown is None:
+        return 0.0
+
+    return (BOMB_TIMER - min_countdown) / BOMB_TIMER
+
+
+def _in_blast_path(
+    x: int,
+    y: int,
+    bx: int,
+    by: int,
+    field: np.ndarray,
+) -> bool:
+    """
+    Return True if (x, y) is in the blast path of a bomb at (bx, by).
+    Blast is blocked only by stone walls; crates do not stop it.
+    """
+    if x == bx and y == by:
+        return True
+
+    for dx, dy in DIRECTIONS.values():
+        for step in range(1, BOMB_POWER + 1):
+            tx, ty = bx + dx * step, by + dy * step
+
+            if field[tx, ty] == -1:
+                break
+
+            if tx == x and ty == y:
+                return True
+
+    return False
+
+
+def blast_crate_count(x: int, y: int, field: np.ndarray) -> int:
+    """
+    Count crates a bomb at (x, y) would destroy.
+    """
+    count = 0
+
+    for dx, dy in DIRECTIONS.values():
+        for step in range(1, BOMB_POWER + 1):
+            tx, ty = x + dx * step, y + dy * step
+
+            if field[tx, ty] == -1:
+                break
+            if field[tx, ty] == 1:
+                count += 1
+
+    return count
+
+
+def blast_enemy_count(x: int, y: int, field: np.ndarray, others: tuple) -> int:
+    """
+    Count opponents a bomb at (x, y) would cover.
+
+    The loop breaks on walls only and never on crates. That is not an
+    oversight: items.py:56 builds blast_coords by walking outward until
+    arena == -1, so a real blast passes straight through crates. Breaking on
+    crates here would make the feature disagree with the game it describes.
+    """
+    if not others:
+        return 0
+
+    occupied = set(others)
+    count = 0
+
+    for dx, dy in DIRECTIONS.values():
+        for step in range(1, BOMB_POWER + 1):
+            tx, ty = x + dx * step, y + dy * step
+
+            if field[tx, ty] == -1:
+                break
+            if (tx, ty) in occupied:
+                count += 1
+
+    return count
+
+
+def escape_path(
+    x: int,
+    y: int,
+    field: np.ndarray,
+    bombs: list,
+    hypothetical: bool = False,
+    others: tuple = (),
+) -> tuple[int | None, bool]:
+    """
+    Find the shortest escape path from (x, y) given active bombs.
+
+    When hypothetical=False (default), only uses existing bombs.
+    Use this for features 17-21 so the escape direction stays valid
+    at every step during an escape sequence.
+
+    When hypothetical=True, also adds a virtual bomb at (x, y) to simulate
+    placing a bomb at the current position. Use this in train.py for
+    GOOD_BOMB / SUICIDE_BOMB assessment.
+
+    A tile holding a live bomb, or another agent, is impassable -- exactly as in
+    valid_action_indices. The two used to disagree: this BFS only tested
+    field[nx, ny] != 0 and so routed straight through bombs, while
+    valid_action_indices refuses to step onto one. The agent was therefore told
+    to escape in a direction it was not allowed to move.
+
+    Measured on seven trained models, 50 rounds each: of 78 self-inflicted
+    deaths, 63 ended with WAIT and 62 of those had an "escape route" whose first
+    step was illegal. For one model the escape direction was legal in 0% of the
+    frozen steps -- it had bombed its way into a pocket, its own bomb sat on the
+    only exit, and WAIT was the sole legal action while danger counted up to 1.0.
+    The same BFS backs the `trap` feature, so it also failed to recognise those
+    tiles as traps before the bomb was dropped.
+
+    Returns:
+        escape_dir: direction index (0=UP,1=RIGHT,2=DOWN,3=LEFT) of first
+                    step on the escape path, or None if no escape exists.
+        can_escape: True if a safe tile is reachable within BOMB_TIMER steps.
+    """
+    danger_tiles = set()
+
+    # Tiles we cannot walk onto. The hypothetical bomb is deliberately absent:
+    # it sits under the agent, which is where the search starts and never
+    # returns to, so blocking it would only block the start square.
+    #
+    # `others` closes the same gap for opponents that bomb tiles had for bombs:
+    # valid_action_indices has always refused to step onto another agent, while
+    # this BFS did not know they existed. In solo play the list is empty and
+    # nothing changes; with opponents on the board an unblocked search would once
+    # again hand back an escape direction the agent is not allowed to take.
+    blocked = {position for position, _timer in bombs}
+    blocked.update(others)
+
+    # Include existing bomb blast paths.
+    for (bx, by), _ in bombs:
+        danger_tiles.add((bx, by))
+        for dx, dy in DIRECTIONS.values():
+            for step in range(1, BOMB_POWER + 1):
+                tx, ty = bx + dx * step, by + dy * step
+                if field[tx, ty] == -1:
+                    break
+                danger_tiles.add((tx, ty))
+
+    # Optionally add a hypothetical bomb at current position.
+    if hypothetical:
+        danger_tiles.add((x, y))
+        for dx, dy in DIRECTIONS.values():
+            for step in range(1, BOMB_POWER + 1):
+                tx, ty = x + dx * step, y + dy * step
+                if field[tx, ty] == -1:
+                    break
+                danger_tiles.add((tx, ty))
+
+    # BFS from current position to find nearest safe tile within BOMB_TIMER steps.
+    queue = deque([(( x, y), None, 0)])
+    visited = {(x, y)}
+
+    while queue:
+        position, first_direction, distance = queue.popleft()
+
+        if distance > BOMB_TIMER:
+            break
+
+        px, py = position
+
+        # Safe tile reached.
+        if position not in danger_tiles:
+            return first_direction, True
+
+        for direction_index, action in enumerate(MOVE_ACTIONS):
+            ddx, ddy = DIRECTIONS[action]
+            next_pos = (px + ddx, py + ddy)
+            nx, ny = next_pos
+
+            if next_pos in visited:
+                continue
+            if not (0 <= nx < field.shape[0] and 0 <= ny < field.shape[1]):
+                continue
+            if field[nx, ny] != 0 or next_pos in blocked:
+                continue
+
+            visited.add(next_pos)
+            first_dir = direction_index if first_direction is None else first_direction
+            queue.append((next_pos, first_dir, distance + 1))
+
+    return None, False
+
+
+def nearest_coin_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """
+    BFS to nearest reachable coin.
+    """
+    field = game_state["field"]
+    start = game_state["self"][3]
+    targets = set(game_state["coins"])
+
+    if not targets:
+        return None, None
+
+    blocked_positions = {
+        position for position, _timer in game_state["bombs"]
+    }
+    blocked_positions.update(
+        other_agent[3] for other_agent in game_state["others"]
+    )
+
+    queue = deque([(start, None, 0)])
+    visited = {start}
+
+    while queue:
+        position, first_direction, distance = queue.popleft()
+
+        if position in targets and position != start:
+            return first_direction, distance
+
+        x, y = position
+
+        for direction_index, action in enumerate(MOVE_ACTIONS):
+            dx, dy = DIRECTIONS[action]
+            next_position = (x + dx, y + dy)
+
+            if next_position in visited:
+                continue
+            if next_position in blocked_positions:
+                continue
+            if field[next_position] != 0:
+                continue
+
+            visited.add(next_position)
+            next_first_direction = direction_index if first_direction is None else first_direction
+            queue.append((next_position, next_first_direction, distance + 1))
+
+    return None, None
+
+
+def nearest_target_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """
+    BFS to nearest reachable target: coins first, crates as fallback.
+    """
+    if game_state["coins"]:
+        direction, distance = nearest_coin_path(game_state)
+        if direction is not None:
+            return direction, distance
+
+    field = game_state["field"]
+    start = game_state["self"][3]
+
+    blocked_positions = {
+        position for position, _timer in game_state["bombs"]
+    }
+    blocked_positions.update(
+        other_agent[3] for other_agent in game_state["others"]
+    )
+
+    queue = deque([(start, None, 0)])
+    visited = {start}
+
+    while queue:
+        position, first_direction, distance = queue.popleft()
+
+        x, y = position
+
+        for direction_index, action in enumerate(MOVE_ACTIONS):
+            dx, dy = DIRECTIONS[action]
+            nx, ny = x + dx, y + dy
+            next_position = (nx, ny)
+
+            if next_position in visited:
+                continue
+            if next_position in blocked_positions:
+                continue
+
+            first_dir = direction_index if first_direction is None else first_direction
+
+            if field[nx, ny] == 1:
+                return first_dir, distance + 1
+
+            if field[nx, ny] != 0:
+                continue
+
+            visited.add(next_position)
+            queue.append((next_position, first_dir, distance + 1))
+
+    return None, None
+
+
+def nearest_enemy_path(
+    game_state: dict,
+) -> tuple[int | None, int | None]:
+    """
+    BFS to the nearest reachable opponent.
+
+    Deliberately not nearest_target_path with a different goal set. That
+    function puts every opponent into blocked_positions, so reusing it with
+    opponents as goals would make the goal unreachable by construction and the
+    feature would be silently dead -- the same way features 6-9 were dead 99.6%
+    of the time. Here only bombs block, and standing on an opponent's tile ends
+    the search.
+
+    An opponent that blocks the way to a further opponent is simply found
+    first, which is the answer we wanted anyway.
+    """
+    field = game_state["field"]
+    start = game_state["self"][3]
+    targets = {other_agent[3] for other_agent in game_state["others"]}
+
+    if not targets:
+        return None, None
+
+    blocked_positions = {
+        position for position, _timer in game_state["bombs"]
+    }
+
+    queue = deque([(start, None, 0)])
+    visited = {start}
+
+    while queue:
+        position, first_direction, distance = queue.popleft()
+
+        if position in targets and position != start:
+            return first_direction, distance
+
+        x, y = position
+
+        for direction_index, action in enumerate(MOVE_ACTIONS):
+            dx, dy = DIRECTIONS[action]
+            next_position = (x + dx, y + dy)
+
+            if next_position in visited:
+                continue
+            if next_position in blocked_positions:
+                continue
+
+            # An opponent stands on a walkable tile, so the field test alone
+            # admits every tile we care about; no special case is needed.
+            if field[next_position] != 0:
+                continue
+
+            visited.add(next_position)
+            next_first_direction = (
+                direction_index if first_direction is None else first_direction
+            )
+            queue.append((next_position, next_first_direction, distance + 1))
+
+    return None, None
