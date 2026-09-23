@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Learning Curve - Coin Heaven</title>
+<style>
+  body { font-family: sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
+  h2 { text-align: center; color: #a9d4ff; margin-bottom: 4px; }
+  .subtitle { text-align: center; color: #888; font-size: 13px; margin-bottom: 24px; }
+  .chart-wrap { background: #16213e; border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  canvas { width: 100%; }
+  .stats { display: flex; justify-content: center; gap: 40px; margin-top: 16px; }
+  .stat { text-align: center; }
+  .stat .val { font-size: 22px; font-weight: bold; color: #ffd97d; }
+  .stat .label { font-size: 12px; color: #aaa; margin-top: 4px; }
+</style>
+</head>
+<body>
+<h2>Learning Curve — Coin Heaven (1501 rounds)</h2>
+<div class="subtitle">coin-heaven scenario | EPSILON_DECAY=0.999 | BFS reward shaping</div>
+
+<div class="stats">
+  <div class="stat"><div class="val">21.2</div><div class="label">초반 평균 코인<br>(Round 1-100)</div></div>
+  <div class="stat"><div class="val">32.3</div><div class="label">후반 평균 코인<br>(Round 1401-1501)</div></div>
+  <div class="stat"><div class="val">50</div><div class="label">최대 코인<br>(전체 수집)</div></div>
+  <div class="stat"><div class="val">147</div><div class="label">최단 클리어<br>(스텝)</div></div>
+</div>
+
+<div class="chart-wrap">
+  <canvas id="coinChart" height="300"></canvas>
+</div>
+<div class="chart-wrap">
+  <canvas id="stepChart" height="200"></canvas>
+</div>
+<div class="chart-wrap">
+  <canvas id="epsilonChart" height="150"></canvas>
+</div>
+
+<script>
+const rounds = [1,11,21,31,41,51,61,71,81,91,101,111,121,131,141,151,161,171,181,191,201,211,221,231,241,251,261,271,281,291,301,311,321,331,341,351,361,371,381,391,401,411,421,431,441,451,461,471,481,491,501,511,521,531,541,551,561,571,581,591,601,611,621,631,641,651,661,671,681,691,701,711,721,731,741,751,761,771,781,791,801,811,821,831,841,851,861,871,881,891,901,911,921,931,941,951,961,971,981,991,1001,1011,1021,1031,1041,1051,1061,1071,1081,1091,1101,1111,1121,1131,1141,1151,1161,1171,1181,1191,1201,1211,1221,1231,1241,1251,1261,1271,1281,1291,1301,1311,1321,1331,1341,1351,1361,1371,1381,1391,1401,1411,1421,1431,1441,1451,1461,1471,1481,1491,1501];
+const coinsRaw = [21,24,22,22,15,21,24,20,10,21,22,21,22,22,24,16,23,18,20,25,36,22,25,21,25,23,33,30,24,30,16,44,14,30,20,14,35,44,16,46,14,42,28,44,22,46,50,22,19,49,19,48,28,19,39,50,37,50,10,50,50,21,50,50,19,50,11,50,5,21,50,14,11,23,20,6,50,18,50,27,50,50,50,11,17,22,16,7,50,16,11,50,19,50,50,21,50,50,10,18,34,8,47,30,50,50,8,50,18,26,20,3,49,23,9,22,17,50,24,7,3,50,50,45,50,46,10,13,10,50,16,50,16,17,20,0,50,18,50,13,14,11,10,38,48,50,42,40,50,4,50];
+const coinsMa = [21.0,21.5,22.8,22.0,22.0,21.4,21.6,21.7,21.4,21.1,21.2,21.4,21.2,21.4,21.4,21.5,21.6,21.9,22.3,23.0,23.5,23.9,24.1,24.7,25.3,25.8,26.3,26.8,27.1,27.4,27.0,27.4,27.3,27.5,27.9,28.2,28.1,28.4,29.1,29.2,30.5,30.5,30.6,30.5,30.7,30.9,31.4,31.1,30.5,30.5,29.4,29.6,29.8,30.6,29.5,30.6,30.1,30.9,31.9,31.2,31.6,31.1,32.2,32.6,33.9,33.5,32.5,31.3,30.1,30.8,31.2,32.2,30.8,29.1,28.5,28.1,29.4,28.8,29.7,29.3,29.7,30.0,32.0,33.3,34.5,34.1,35.0,35.1,35.9,36.4,35.8,34.8,32.4,32.9,31.5,31.8,31.7,32.2,30.5,30.4,29.5,29.7,31.3,31.4,30.4,30.1,29.9,30.1,30.5,30.3,31.9,31.2,31.0,30.5,31.7,32.2,32.1,32.2,33.4,33.1,30.9,30.3,29.4,29.4,30.5,29.6,29.1,28.2,26.4,26.9,29.1,30.6,30.1,29.7,28.7,28.4,30.1,31.1,32.6,33.0,32.5,31.9,33.6,34.0,34.7,34.5,33.4,32.6,32.3,31.3,32.3];
+const stepsMa = [400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,400,398.2,397.8,397.4,397.0,397.0,396.6,395.6,395.0,394.3,392.5,392.6,389.8,384.6,384.7,382.7,380.9,377.7,376.0,372.1,369.7,371.4,370.1,375.6,372.9,372.4,369.9,370.9,371.7,374.7,373.0,366.9,369.6,366.9,363.9,358.9,357.7,356.0,355.3,351.1,353.6,350.4,349.5,342.5,346.4,349.6,349.8,354.7,347.2,349.7,344.1,342.4,340.6,346.4,344.1,348.3,345.6,339.7,337.2,339.6,339.0,343.4,340.2,343.2,344.0,334.0,338.3,339.3,342.9,338.6,339.9,336.3,339.8,327.1,323.0,333.2,335.2,334.2,337.9,328.9,333.0,336.0,336.1,347.3,345.0,329.6,325.2,327.4,323.4,331.2,328.8,321.4,316.9,309.3,316.5,320.6,319.5,310.3,311.4,310.8,310.6,316.0,319.8,319.8,315.7,313.3];
+const epsilon = [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.999,0.9891,0.9792,0.9695,0.9598,0.9503,0.9408,0.9314,0.9222,0.913,0.9039,0.8949,0.886,0.8772,0.8684,0.8598,0.8512,0.8427,0.8344,0.8261,0.8178,0.8097,0.8016,0.7936,0.7857,0.7779,0.7702,0.7625,0.7549,0.7474,0.74,0.7326,0.7253,0.7181,0.7109,0.7039,0.6969,0.6899,0.683,0.6762,0.6695,0.6629,0.6563,0.6497,0.6433,0.6368,0.6305,0.6242,0.618,0.6119,0.6058,0.5997,0.5938,0.5879,0.582,0.5762,0.5705,0.5648,0.5592,0.5536,0.5481,0.5426,0.5372,0.5319,0.5266,0.5214,0.5162,0.511,0.5059,0.5009,0.4959,0.491,0.4861,0.4813,0.4765,0.4717,0.467,0.4624,0.4578,0.4532,0.4487,0.4442,0.4398,0.4354,0.4311,0.4268,0.4226,0.4184,0.4142,0.4101,0.406,0.4019,0.3979,0.394,0.3901,0.3862,0.3823,0.3785,0.3748,0.371,0.3673,0.3637,0.3601,0.3565,0.3529,0.3494,0.3459,0.3425,0.3391,0.3357,0.3324,0.329,0.3258,0.3225,0.3193,0.3161,0.313,0.3099,0.3068,0.3037,0.3007,0.2977,0.2948,0.2918,0.2889,0.286,0.2832,0.2804,0.2776,0.2748,0.2721,0.2694,0.2667,0.264,0.2614,0.2588,0.2562,0.2537,0.2512,0.2487,0.2462];
+
+function drawChart(canvasId, datasets, yLabel, yMin, yMax) {
+  const canvas = document.getElementById(canvasId);
+  const ctx = canvas.getContext('2d');
+  const W = canvas.offsetWidth;
+  const H = canvas.offsetHeight || parseInt(canvas.getAttribute('height'));
+  canvas.width = W;
+  canvas.height = H;
+
+  const pad = { top: 20, right: 20, bottom: 40, left: 50 };
+  const cW = W - pad.left - pad.right;
+  const cH = H - pad.top - pad.bottom;
+
+  const xScale = x => pad.left + (x / 1501) * cW;
+  const yScale = y => pad.top + cH - ((y - yMin) / (yMax - yMin)) * cH;
+
+  // grid
+  ctx.strokeStyle = '#2a2a4a';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 5; i++) {
+    const y = yMin + (yMax - yMin) * i / 5;
+    const py = yScale(y);
+    ctx.beginPath(); ctx.moveTo(pad.left, py); ctx.lineTo(pad.left + cW, py); ctx.stroke();
+    ctx.fillStyle = '#888'; ctx.font = '11px sans-serif'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round(y), pad.left - 6, py + 4);
+  }
+  for (let r = 0; r <= 1500; r += 300) {
+    const px = xScale(r);
+    ctx.beginPath(); ctx.moveTo(px, pad.top); ctx.lineTo(px, pad.top + cH); ctx.stroke();
+    ctx.fillStyle = '#888'; ctx.textAlign = 'center';
+    ctx.fillText(r, px, pad.top + cH + 20);
+  }
+
+  // axes label
+  ctx.fillStyle = '#aaa'; ctx.font = '12px sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText('Round', pad.left + cW / 2, H - 4);
+
+  datasets.forEach(({ data, color, alpha, lineWidth }) => {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.globalAlpha = alpha || 1;
+    ctx.lineWidth = lineWidth || 1.5;
+    rounds.forEach((r, i) => {
+      const px = xScale(r), py = yScale(data[i]);
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  });
+}
+
+window.addEventListener('load', () => {
+  drawChart('coinChart', [
+    { data: coinsRaw, color: '#4a6fa5', alpha: 0.3, lineWidth: 1 },
+    { data: coinsMa,  color: '#ffd97d', alpha: 1,   lineWidth: 2.5 },
+  ], 'Coins', 0, 55);
+
+  drawChart('stepChart', [
+    { data: stepsMa, color: '#6fcf97', alpha: 1, lineWidth: 2 },
+  ], 'Steps', 280, 410);
+
+  drawChart('epsilonChart', [
+    { data: epsilon, color: '#eb5757', alpha: 1, lineWidth: 2 },
+  ], 'Epsilon', 0, 1.1);
+
+  // 범례
+  const coinCanvas = document.getElementById('coinChart');
+  const ctx = coinCanvas.getContext('2d');
+  ctx.font = '12px sans-serif';
+  ctx.fillStyle = '#4a6fa5'; ctx.fillRect(60, 10, 20, 3);
+  ctx.fillStyle = '#ccc'; ctx.fillText('매 라운드 코인', 85, 14);
+  ctx.fillStyle = '#ffd97d'; ctx.fillRect(200, 10, 20, 3);
+  ctx.fillStyle = '#ccc'; ctx.fillText('100라운드 이동평균', 225, 14);
+});
+</script>
+</body>
+</html>
